@@ -3,11 +3,16 @@ import firedrake as fd
 from firedrake.petsc import PETSc
 from firedrake.output import VTKFile
 from firedrake.__future__ import Interpolator, interpolate
-from firedrake.adjoint import (continue_annotation, get_working_tape, pause_annotation,
-                               Control, ReducedFunctional, minimize)
+from firedrake.adjoint import (continue_annotation, get_working_tape,
+                               pause_annotation, Control, minimize)
+from firedrake.adjoint import ReducedFunctional  # noqa: F401
+from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional  # noqa: F401
+
 import numpy as np
 from sys import exit
 import argparse
+
+pause_annotation()
 
 Print = PETSc.Sys.Print
 
@@ -58,9 +63,6 @@ parser.add_argument('--tol', type=float, default=1e-3, help='Tolerance of optimi
 parser.add_argument('--prior_mag', type=float, default=1.1, help='Magnitude of background vs truth.')
 parser.add_argument('--prior_shift', type=float, default=0.05, help='Phase shift in background vs truth.')
 parser.add_argument('--prior_noise', type=float, default=0.05, help='Noise magnitude in background.')
-parser.add_argument('--B', type=float, default=1e-1, help='Background trust weighting.')
-parser.add_argument('--R', type=float, default=1, help='Observation trust weighting.')
-parser.add_argument('--Rfinal', type=float, default=0, help='Terminal cost trust weighting.')
 parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
 parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
@@ -68,6 +70,7 @@ parser.add_argument('--n_obs', type=int, default=10, help='Number of observation
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test.')
 parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
+parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 
 args = parser.parse_known_args()
@@ -150,22 +153,30 @@ y = []
 utargets = [ic_target.copy(deepcopy=True)]
 
 # calculate "ground truth" values from target ic
+
 t = 0.0
 nsteps = int(0)
+obs_times = [0]
 y.append(H(un))
-while (t <= args.tend):
+while ((t + 0.5*dt) <= args.tend):
     solver.solve()
     un.assign(un1)
     t += dt
     utargets.append(un.copy(deepcopy=True))
     if ((nsteps+1) % args.obs_freq) == 0:
+        obs_times.append(nsteps)
         y.append(H(un))
     nsteps += int(1)
 uend_target.assign(un)
 Print(f"Number of timesteps {nsteps = }")
+Print(f"Number of observations {len(y) = }")
 
-# Initialise forward solution
 Print("Setting up adjoint model")
+
+
+def errnorm2(x, y):
+    return fd.assemble(fd.inner(x-y, x-y)*fd.dx)
+
 
 # Initialise forward model from prior/background initial conditions
 ic_approx = background.copy(deepcopy=True)
@@ -173,38 +184,37 @@ continue_annotation()
 un.assign(ic_approx)
 un1.assign(ic_approx)
 
-hx = []
 uapprox = [ic_approx.copy(deepcopy=True)]
+
+ic = Control(ic_approx)
+
+
+def background_fn(state):
+    return errnorm2(state, background)
+
+
+def make_observation_fn(i):
+    def observation_fn(state):
+        return errnorm2(H(state), y[i])
+    return observation_fn
+
+
+Jhat = AllAtOnceReducedFunctional(ic, background_fn,
+                                  make_observation_fn(0),
+                                  weak_constraint=False)
 
 Print("Running forward model")
 tape = get_working_tape()
-hx.append(H(un))
+observation_idx = 1
 for i in range(nsteps):
     solver.solve()
     un.assign(un1)
     uapprox.append(un.copy(deepcopy=True))
-    if ((i+1) % args.obs_freq) == 0:
-        hx.append(H(un))
+    # if ((i+1) % args.obs_freq) == 0:
+    if i == obs_times[observation_idx]:
+        Jhat.set_observation(un, make_observation_fn(observation_idx))
+        observation_idx += 1
 uend_approx = un.copy(deepcopy=True)
-
-Print("Setting up ReducedFunctional")
-B = fd.Constant(args.B)
-R = fd.Constant(args.R)
-Rf = fd.Constant(args.Rfinal)
-
-# How far from final solution?
-terminal_err = uend_approx - uend_target
-# How far from prior ic?
-bkg_err = ic_approx - background
-# How far from observations?
-obs_err = sum(fd.inner(hi-yi, hi-yi)*fd.dx for hi, yi in zip(hx, y))
-
-J = fd.assemble(Rf*fd.inner(terminal_err, terminal_err)*fd.dx)
-J += fd.assemble(B*fd.inner(bkg_err, bkg_err)*fd.dx)
-J += fd.assemble(R*obs_err)
-
-ic = Control(ic_approx)
-Jhat = ReducedFunctional(J, ic)
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_test
@@ -216,6 +226,7 @@ if args.taylor_test:
 Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
+
 ic_opt = minimize(Jhat, options={'disp': True}, method="L-BFGS-B", tol=args.tol)
 
 Print(f"Initial functional: {Jhat(background)}")
@@ -240,9 +251,10 @@ Print(f"Final ic error: {fd.errornorm(ic_opt, ic_target) = }")
 Print(f"Initial terminal error: {fd.errornorm(uend_approx, uend_target) = }")
 Print(f"Final terminal error: {fd.errornorm(uend_opt, uend_target) = }")
 
-vnames = ["TargetVelocity", "InitialGuess", "OptimisedVelocity"]
-write = InterpWriter("output/burgers_target.pvd", V, V_out, vnames).write
-for i, us in enumerate(zip(utargets, uapprox, uopt)):
-    write(*us, t=i*dt)
+if args.vtk:
+    vnames = ["TargetVelocity", "InitialGuess", "OptimisedVelocity"]
+    write = InterpWriter("output/burgers_target.pvd", V, V_out, vnames).write
+    for i, us in enumerate(zip(utargets, uapprox, uopt)):
+        write(*us, t=i*dt)
 
 tape.clear_tape()
