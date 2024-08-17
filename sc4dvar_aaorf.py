@@ -3,11 +3,12 @@ import firedrake as fd
 from firedrake.petsc import PETSc
 from firedrake.output import VTKFile
 from firedrake.__future__ import Interpolator, interpolate
-from firedrake.adjoint import (continue_annotation, get_working_tape,
-                               pause_annotation, Control, minimize)
+from firedrake.adjoint import (continue_annotation, pause_annotation,
+                               get_working_tape, Control, minimize)
 from firedrake.adjoint import ReducedFunctional  # noqa: F401
 from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional  # noqa: F401
 
+from functools import partial
 import numpy as np
 from sys import exit
 import argparse
@@ -167,40 +168,26 @@ while ((t + 0.5*dt) <= args.tend):
         obs_times.append(nsteps)
         y.append(H(un))
     nsteps += int(1)
-uend_target.assign(un)
 Print(f"Number of timesteps {nsteps = }")
 Print(f"Number of observations {len(y) = }")
 
 Print("Setting up adjoint model")
 
-
-def errnorm2(x, y):
-    return fd.assemble(fd.inner(x-y, x-y)*fd.dx)
-
-
 # Initialise forward model from prior/background initial conditions
-ic_approx = background.copy(deepcopy=True)
 continue_annotation()
-un.assign(ic_approx)
-un1.assign(ic_approx)
 
-uapprox = [ic_approx.copy(deepcopy=True)]
+un.assign(background)
+un1.assign(background)
 
-ic = Control(ic_approx)
-
-
-def background_fn(state):
-    return errnorm2(state, background)
+uapprox = [background.copy(deepcopy=True, annotate=False)]
 
 
-def make_observation_fn(i):
-    def observation_fn(state):
-        return errnorm2(H(state), y[i])
-    return observation_fn
+def observation_err(i, state):
+    return H(state) - y[i]
 
 
-Jhat = AllAtOnceReducedFunctional(ic, background_fn,
-                                  make_observation_fn(0),
+Jhat = AllAtOnceReducedFunctional(Control(background),
+                                  observation_err=partial(observation_err, 0),
                                   weak_constraint=False)
 
 Print("Running forward model")
@@ -209,18 +196,19 @@ observation_idx = 1
 for i in range(nsteps):
     solver.solve()
     un.assign(un1)
-    uapprox.append(un.copy(deepcopy=True))
-    # if ((i+1) % args.obs_freq) == 0:
+    uapprox.append(un.copy(deepcopy=True, annotate=False))
+
     if i == obs_times[observation_idx]:
-        Jhat.set_observation(un, make_observation_fn(observation_idx))
+        Jhat.set_observation(un, partial(observation_err, observation_idx))
         observation_idx += 1
-uend_approx = un.copy(deepcopy=True)
+
 
 if args.taylor_test:
+    Print("Running Taylor test on strong-constraint reduced functional")
     from firedrake.adjoint import taylor_test
     h = fd.Function(V)
     h.dat.data[:] = np.random.random_sample(h.dat.data.shape)
-    Print(f"{taylor_test(Jhat, ic_approx, h) = }")
+    Print(f"{taylor_test(Jhat, background, h) = }")
     exit()
 
 Print("Minimizing 4DVar functional")
@@ -244,12 +232,11 @@ for _ in range(nsteps):
     solver.solve()
     un.assign(un1)
     uopt.append(un.copy(deepcopy=True))
-uend_opt = un.copy(deepcopy=True)
 
 Print(f"Initial ic error: {fd.errornorm(background, ic_target) = }")
 Print(f"Final ic error: {fd.errornorm(ic_opt, ic_target) = }")
-Print(f"Initial terminal error: {fd.errornorm(uend_approx, uend_target) = }")
-Print(f"Final terminal error: {fd.errornorm(uend_opt, uend_target) = }")
+Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1]) = }")
+Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1]) = }")
 
 if args.vtk:
     vnames = ["TargetVelocity", "InitialGuess", "OptimisedVelocity"]
