@@ -1,16 +1,15 @@
 # Burgers equation N-wave on a 1D periodic domain
 import firedrake as fd
 from firedrake.petsc import PETSc
-from firedrake.output import VTKFile
-from firedrake.__future__ import Interpolator, interpolate
+from firedrake.__future__ import interpolate
 from firedrake.adjoint import (continue_annotation, pause_annotation,
                                get_working_tape, Control, minimize)
 from firedrake.adjoint import ReducedFunctional  # noqa: F401
 from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional  # noqa: F401
+from burgers_utils import noisy_double_sin, burgers_stepper
 
 from functools import partial
 import numpy as np
-from sys import exit
 import argparse
 
 pause_annotation()
@@ -18,40 +17,8 @@ pause_annotation()
 Print = PETSc.Sys.Print
 
 
-class InterpWriter:
-    def __init__(self, fname, Vsrc, Vout, vnames=None):
-        vnames = [] if vnames is None else vnames
-        self.Vsrc, self.Vout = Vsrc, Vout
-        self.ofile = VTKFile(fname)
-        self.usrc = fd.Function(Vsrc)
-        if vnames is None:
-            self.uouts = [fd.Function(Vout)]
-        else:
-            self.uouts = [fd.Function(Vout, name=name)
-                          for name in vnames]
-        self.interpolator = Interpolator(self.usrc, Vout)
-
-    def write(self, *args, t=None):
-        for us, uo in zip(args, self.uouts):
-            self.usrc.assign(us)
-            uo.assign(fd.assemble(self.interpolator.interpolate()))
-        self.ofile.write(*self.uouts, time=t)
-
-
-def initial(V, avg=1, mag=0.5, shift=0, noise=None, seed=None):
-    x, = fd.SpatialCoordinate(V.mesh())
-    ic = fd.project(fd.as_vector([avg + mag*fd.sin(2*fd.pi*(x+shift))
-                                  + 0.2*mag*fd.cos(6*fd.pi*(x-shift))]), V)
-    if seed is not None:
-        np.random.seed(seed)
-    if noise is not None:
-        for dat in ic.dat:
-            dat.data[:] += noise*np.random.random_sample(dat.data.shape)
-    return ic
-
-
 parser = argparse.ArgumentParser(
-    description='Strong constraint 4DVar for the viscous Burgers equation.',
+    description='Strong constraint 4DVar for the viscous Burgers equation using firedrake.AllAtOnceReducedFunctional.',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter
 )
 parser.add_argument('--nx', type=int, default=100, help='Number of elements.')
@@ -60,18 +27,20 @@ parser.add_argument('--ubar', type=float, default=1.0, help='Average initial vel
 parser.add_argument('--tend', type=float, default=1.0, help='Final integration time.')
 parser.add_argument('--re', type=float, default=1e2, help='Approximate Reynolds number.')
 parser.add_argument('--theta', type=float, default=0.5, help='Implicit timestepping parameter.')
-parser.add_argument('--tol', type=float, default=1e-3, help='Tolerance of optimiser.')
+parser.add_argument('--tol', type=float, default=1e-2, help='Tolerance of optimiser.')
 parser.add_argument('--prior_mag', type=float, default=1.1, help='Magnitude of background vs truth.')
 parser.add_argument('--prior_shift', type=float, default=0.05, help='Phase shift in background vs truth.')
 parser.add_argument('--prior_noise', type=float, default=0.05, help='Noise magnitude in background.')
+parser.add_argument('--B', type=float, default=1e-1, help='Background trust weighting.')
+parser.add_argument('--R', type=float, default=1.0, help='Observation trust weighting.')
 parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
 parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
 parser.add_argument('--n_obs', type=int, default=10, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
-parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test.')
-parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
+parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor tes and exitt.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
+parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 
 args = parser.parse_known_args()
@@ -84,51 +53,29 @@ Print("Setting up problem")
 np.random.seed(args.seed)
 
 # problem parameters
-nu = fd.Constant(1/args.re)
+nu = 1/args.re
 dt = args.cfl/(args.nx*args.ubar)
-dt1 = fd.Constant(1/dt)
-theta = fd.Constant(args.theta)
+theta = args.theta
+
+# error covariance inverse
+B = fd.Constant(args.B)
+R = fd.Constant(args.R)
 
 mesh = fd.PeriodicUnitIntervalMesh(args.nx)
 mesh_out = fd.UnitIntervalMesh(args.nx)
 
-V = fd.VectorFunctionSpace(mesh, "CG", 2)
-
-un = fd.Function(V, name="Velocity")
-un1 = fd.Function(V, name="VelocityNext")
+un, un1, stepper = burgers_stepper(nu, dt, theta, mesh)
+V = un.function_space()
 
 # true initial condition and perturbed starting guess
-ic_target = initial(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
-background = initial(V, avg=args.ubar, mag=0.5*args.prior_mag,
-                     shift=args.prior_shift, noise=args.prior_noise)
+ic_target = noisy_double_sin(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
+background = noisy_double_sin(V, avg=args.ubar, mag=0.5*args.prior_mag,
+                              shift=args.prior_shift, noise=args.prior_noise, seed=args.seed)
 
 uend_target = fd.Function(V, name="Target")
 
 un.assign(ic_target)
 un1.assign(ic_target)
-
-
-def mass(u, v):
-    return fd.inner(u, v)*fd.dx
-
-
-def tendency(u, v):
-    A = fd.inner(fd.dot(u, fd.nabla_grad(u)), v)
-    D = nu*fd.inner(fd.grad(u), fd.grad(v))
-    return (A + D)*fd.dx
-
-
-v = fd.TestFunction(V)
-M = dt1*mass(un1-un, v)
-A = theta*tendency(un1, v) + (1-theta)*tendency(un, v)
-
-F = M + A
-
-solver = fd.NonlinearVariationalSolver(
-    fd.NonlinearVariationalProblem(F, un1))
-
-# output on non-periodic mesh
-V_out = fd.VectorFunctionSpace(mesh_out, "CG", 1)
 
 # target forward solution
 
@@ -160,7 +107,7 @@ nsteps = int(0)
 obs_times = [0]
 y.append(H(un))
 while ((t + 0.5*dt) <= args.tend):
-    solver.solve()
+    stepper.solve()
     un.assign(un1)
     t += dt
     utargets.append(un.copy(deepcopy=True))
@@ -173,8 +120,20 @@ Print(f"Number of observations {len(y) = }")
 
 Print("Setting up adjoint model")
 
+
+# weighted l2 inner product for error covariances
+def wl2prod(x, w=1.0):
+    return fd.assemble(fd.inner(x, w*x)*fd.dx)
+
+
+background_iprod = partial(wl2prod, w=B)
+observation_iprod = partial(wl2prod, w=R)
+
+
 # Initialise forward model from prior/background initial conditions
+# and log observations as we go
 continue_annotation()
+tape = get_working_tape()
 
 un.assign(background)
 un1.assign(background)
@@ -188,24 +147,27 @@ def observation_err(i, state):
 
 Jhat = AllAtOnceReducedFunctional(Control(background),
                                   observation_err=partial(observation_err, 0),
+                                  observation_iprod=observation_iprod,
+                                  background_iprod=background_iprod,
                                   weak_constraint=False)
 
 Print("Running forward model")
-tape = get_working_tape()
 observation_idx = 1
 for i in range(nsteps):
-    solver.solve()
+    stepper.solve()
     un.assign(un1)
     uapprox.append(un.copy(deepcopy=True, annotate=False))
 
     if i == obs_times[observation_idx]:
-        Jhat.set_observation(un, partial(observation_err, observation_idx))
+        Jhat.set_observation(un, partial(observation_err, observation_idx),
+                             observation_iprod=observation_iprod)
         observation_idx += 1
 
 
 if args.taylor_test:
-    Print("Running Taylor test on strong-constraint reduced functional")
     from firedrake.adjoint import taylor_test
+    from sys import exit
+    Print("Running Taylor test on strong-constraint reduced functional")
     h = fd.Function(V)
     h.dat.data[:] = np.random.random_sample(h.dat.data.shape)
     Print(f"{taylor_test(Jhat, background, h) = }")
@@ -230,7 +192,7 @@ uopt = [ic_opt.copy(deepcopy=True)]
 un.assign(ic_opt)
 un1.assign(ic_opt)
 for _ in range(nsteps):
-    solver.solve()
+    stepper.solve()
     un.assign(un1)
     uopt.append(un.copy(deepcopy=True))
 
@@ -240,6 +202,9 @@ Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1]) = }")
 Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1]) = }")
 
 if args.vtk:
+    from burgers_utils import InterpWriter
+    # output on non-periodic mesh
+    V_out = fd.VectorFunctionSpace(mesh_out, "CG", 1)
     vnames = ["TargetVelocity", "InitialGuess", "OptimisedVelocity"]
     write = InterpWriter("output/burgers_target.pvd", V, V_out, vnames).write
     for i, us in enumerate(zip(utargets, uapprox, uopt)):
