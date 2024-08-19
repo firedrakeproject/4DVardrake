@@ -215,7 +215,8 @@ Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-ic_opt = minimize(Jhat, options={'disp': True}, method="L-BFGS-B", tol=args.tol)
+options = {'disp': True, 'maxcor': 30, 'gtol': args.tol}
+ic_opt = minimize(Jhat, options=options, method="L-BFGS-B")
 
 Print(f"Initial functional: {Jhat(background)}")
 Print(f"Final functional: {Jhat(ic_opt)}")
