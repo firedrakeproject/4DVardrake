@@ -107,18 +107,18 @@ t = 0.0
 nsteps = int(0)
 obs_times = [0]
 y.append(H(un, name=f'Observation {len(obs_times)-1}'))
-while (t <= args.tend):
+while (t + 0.5*dt) <= args.tend:
     stepper.solve()
     un.assign(un1)
     t += dt
+    nsteps += int(1)
     utargets.append(un.copy(deepcopy=True))
-    if ((nsteps+1) % args.obs_freq) == 0:
+    if (nsteps % args.obs_freq) == 0:
         obs_times.append(nsteps)
         y.append(H(un, name=f'Observation {len(obs_times)-1}'))
-    nsteps += int(1)
 Print(f"Number of timesteps {nsteps = }")
 Print(f"Number of observations {len(y) = }")
-# Print(f"{obs_times = }")
+Print(f"{obs_times = }")
 
 # Initialise forward solution
 Print("Setting up adjoint model")
@@ -166,7 +166,7 @@ for i in range(nsteps):
     un.assign(un1)
     uapprox.append(un.copy(deepcopy=True, annotate=False))
 
-    if i == obs_times[min(observation_idx, len(obs_times)-1)]:
+    if (i + 1) == obs_times[observation_idx]:
         # smuggle initial guess at this time into the control without the tape seeing
         uc = ucontrols[observation_idx]
         with stop_annotating():
@@ -187,6 +187,8 @@ for i in range(nsteps):
         un1.assign(uc)
 
         observation_idx += 1
+        if observation_idx == len(obs_times):
+            break
 
 Print("Setting up ReducedFunctional")
 controls = [Control(uc) for uc in ucontrols]

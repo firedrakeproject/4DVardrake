@@ -115,13 +115,14 @@ while ((t + 0.5*dt) <= args.tend):
     stepper.solve()
     un.assign(un1)
     t += dt
+    nsteps += int(1)
     utargets.append(un.copy(deepcopy=True))
-    if ((nsteps+1) % args.obs_freq) == 0:
+    if (nsteps % args.obs_freq) == 0:
         obs_times.append(nsteps)
         y.append(H(un, name=f'Observation {len(obs_times)-1}'))
-    nsteps += int(1)
 Print(f"Number of timesteps {nsteps = }")
 Print(f"Number of observations {len(y) = }")
+Print(f"{obs_times = }")
 
 Print("Setting up adjoint model")
 
@@ -156,6 +157,7 @@ Jhat = AllAtOnceReducedFunctional(
     observation_iprod=observation_iprod,
     observation_err=partial(observation_err, 0, name='Model observation 0'),
     weak_constraint=False)
+
 Jhat.background.topological.rename("Background")
 
 Print("Running forward model")
@@ -165,11 +167,14 @@ for i in range(nsteps):
     un.assign(un1)
     uapprox.append(un.copy(deepcopy=True, annotate=False))
 
-    if i == obs_times[observation_idx]:
+    if (i + 1) == obs_times[observation_idx]:
         obs_error = partial(observation_err, observation_idx,
                             name=f'Model observation {observation_idx}')
         Jhat.set_observation(un, obs_error, observation_iprod=observation_iprod)
+
         observation_idx += 1
+        if observation_idx == len(obs_times):
+            break
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_test
