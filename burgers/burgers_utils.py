@@ -57,7 +57,8 @@ def burgers_stepper(nu, dt, theta, mesh, params=None):
 
     stepper = fd.NonlinearVariationalSolver(
         fd.NonlinearVariationalProblem(F, un1),
-        solver_parameters=params)
+        solver_parameters=params,
+        ad_block_tag='Forward model')
 
     return un, un1, stepper
 

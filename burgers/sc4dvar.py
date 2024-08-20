@@ -6,6 +6,7 @@ from firedrake.adjoint import (continue_annotation, get_working_tape, pause_anno
                                Control, ReducedFunctional, minimize)
 from burgers_utils import noisy_double_sin, burgers_stepper
 import numpy as np
+from functools import partial
 import argparse
 
 pause_annotation()
@@ -36,6 +37,7 @@ parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
+parser.add_argument('--visualise', action='store_true', help='Visualise DAG.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 
 args = parser.parse_known_args()
@@ -56,7 +58,7 @@ theta = args.theta
 B = fd.Constant(args.B)
 R = fd.Constant(args.R)
 
-mesh = fd.PeriodicUnitIntervalMesh(args.nx)
+mesh = fd.PeriodicUnitIntervalMesh(args.nx, name="Domain mesh")
 mesh_out = fd.UnitIntervalMesh(args.nx)
 
 un, un1, stepper = burgers_stepper(nu, dt, theta, mesh)
@@ -66,6 +68,7 @@ V = un.function_space()
 ic_target = noisy_double_sin(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
 background = noisy_double_sin(V, avg=args.ubar, mag=0.5*args.prior_mag,
                               shift=args.prior_shift, noise=args.prior_noise, seed=args.seed)
+background.topological.rename('Background')
 
 uend_target = fd.Function(V, name="Target")
 
@@ -83,12 +86,15 @@ if args.obs_spacing == 'equidistant':
 if args.obs_spacing == 'random':
     obs_points = [[x] for x in sorted(np.random.random_sample(args.n_obs))]
 
-obs_mesh = fd.VertexOnlyMesh(mesh, obs_points)
+obs_mesh = fd.VertexOnlyMesh(mesh, obs_points, name="Observation locations")
 Vobs = fd.VectorFunctionSpace(obs_mesh, "DG", 0)
 
 
-def H(x):
-    return fd.assemble(interpolate(x, Vobs))
+def H(x, name=None):
+    hx = fd.assemble(interpolate(x, Vobs), ad_block_tag='Observation operator')
+    if name is not None:
+        hx.topological.rename(name)
+    return hx
 
 
 y = []
@@ -98,7 +104,7 @@ utargets = [ic_target.copy(deepcopy=True)]
 t = 0.0
 nsteps = int(0)
 obs_times = [0]
-y.append(H(un))
+y.append(H(un, name=f'Observation {len(obs_times)-1}'))
 while (t <= args.tend):
     stepper.solve()
     un.assign(un1)
@@ -106,23 +112,27 @@ while (t <= args.tend):
     utargets.append(un.copy(deepcopy=True))
     if ((nsteps+1) % args.obs_freq) == 0:
         obs_times.append(nsteps)
-        y.append(H(un))
+        y.append(H(un, name=f'Observation {len(obs_times)-1}'))
     nsteps += int(1)
 Print(f"Number of timesteps {nsteps = }")
 Print(f"Number of observations {len(y) = }")
+Print(f"{obs_times = }")
 
 # Initialise forward solution
 Print("Setting up adjoint model")
 
 
 # weighted l2 inner product
-def wl2prod(x, w=1.0):
-    return fd.assemble(fd.inner(x, w*x)*fd.dx)
+def wl2prod(x, w=1.0, ad_block_tag=None):
+    return fd.assemble(fd.inner(x, w*x)*fd.dx, ad_block_tag=ad_block_tag)
 
+
+observation_iprod = partial(wl2prod, w=R, ad_block_tag='Observation error')
 
 # Initialise forward model from prior/background initial conditions
 # and accumulate strong constraint functional as we go
-ic_approx = background.copy(deepcopy=True)
+ic_approx = background.copy(deepcopy=True, annotate=False)
+ic_approx.topological.rename("Control")
 
 continue_annotation()
 tape = get_working_tape()
@@ -137,14 +147,14 @@ uapprox = [ic_approx.copy(deepcopy=True, annotate=False)]
 
 # background error
 background_err = ic_approx - background
-J = wl2prod(background_err, B)
+J = wl2prod(background_err, B, ad_block_tag='Background error')
 
 Print("Running forward model")
 
 # initial observation error
-hx.append(H(un))
+hx.append(H(un, name=f'Model observation {observation_idx}'))
 observation_error = hx[-1] - y[observation_idx]
-J += wl2prod(observation_error, R)
+J += observation_iprod(observation_error)
 observation_idx += 1
 
 for i in range(nsteps):
@@ -152,15 +162,16 @@ for i in range(nsteps):
     un.assign(un1)
     uapprox.append(un.copy(deepcopy=True, annotate=False))
 
-    if i == obs_times[observation_idx]:
-        hx.append(H(un))
+    if i == obs_times[min(observation_idx, len(obs_times)-1)]:
+        hx.append(H(un, name=f'Model observation {observation_idx}'))
         observation_error = hx[-1] - y[observation_idx]
-        J += wl2prod(observation_error, R)
+        J += observation_iprod(observation_error)
         observation_idx += 1
 
 Print("Setting up ReducedFunctional")
 ic = Control(ic_approx)
 Jhat = ReducedFunctional(J, ic)
+Jhat.optimize_tape()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_test
@@ -175,12 +186,14 @@ Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-options = {'disp': True, 'maxcor': 30, 'gtol': args.tol}
+options = {'disp': True, 'maxcor': 30, 'ftol': args.tol}
 ic_opt = minimize(Jhat, options=options, method="L-BFGS-B")
 
 Print(f"Initial functional: {Jhat(background)}")
 Print(f"Final functional: {Jhat(ic_opt)}")
 
+if args.visualise:
+    tape.visualise(output='dag_sc.pdf')
 tape.clear_tape()
 pause_annotation()
 
