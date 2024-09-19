@@ -23,7 +23,9 @@ parser.add_argument('--ubar', type=float, default=1.0, help='Average initial vel
 parser.add_argument('--tend', type=float, default=1.0, help='Final integration time.')
 parser.add_argument('--re', type=float, default=1e2, help='Approximate Reynolds number.')
 parser.add_argument('--theta', type=float, default=0.5, help='Implicit timestepping parameter.')
-parser.add_argument('--tol', type=float, default=1e-2, help='Tolerance of optimiser.')
+parser.add_argument('--ftol', type=float, default=1e-2, help='Optimiser tolerance for relative function reduction.')
+parser.add_argument('--gtol', type=float, default=1e-2, help='Optimiser tolerance for gradient norm.')
+parser.add_argument('--maxcor', type=int, default=20, help='Optimiser max corrections.')
 parser.add_argument('--prior_mag', type=float, default=1.1, help='Magnitude of background vs truth.')
 parser.add_argument('--prior_shift', type=float, default=0.05, help='Phase shift in background vs truth.')
 parser.add_argument('--prior_noise', type=float, default=0.05, help='Noise magnitude in background.')
@@ -33,7 +35,7 @@ parser.add_argument('--R', type=float, default=1.0, help='Observation trust weig
 parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
 parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
-parser.add_argument('--n_obs', type=int, default=10, help='Number of observations in space. Only used if obs_spacing=random.')
+parser.add_argument('--n_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
@@ -136,8 +138,7 @@ model_iprod = partial(wl2prod, w=Q, ad_block_tag='Model error')
 # and accumulate weak constraint functional as we go
 
 # approximation to solution at each observation time
-ucontrols = [fd.Function(V, name=f"Control {i}").assign(background)
-             for i in range(len(obs_times))]
+ucontrols = [fd.Function(V, name="Control 0").assign(background)]
 
 continue_annotation()
 tape = get_working_tape()
@@ -168,9 +169,10 @@ for i in range(nsteps):
 
     if (i + 1) == obs_times[observation_idx]:
         # smuggle initial guess at this time into the control without the tape seeing
-        uc = ucontrols[observation_idx]
         with stop_annotating():
-            uc.assign(un)
+            uc = un._ad_copy()
+            ucontrols.append(uc)
+            uc.topological.rename(f"Control {observation_idx}")
 
         # model error:
         model_err = un - uc
@@ -181,8 +183,8 @@ for i in range(nsteps):
         J += observation_iprod(observation_error)
 
         # Look we're starting this time-chunk from an unrelated value... really!
-        with stop_annotating(modifies=[un, un1]):
-            pass
+        # with stop_annotating(modifies=[un, un1]):
+        #     pass
         un.assign(uc)
         un1.assign(uc)
 
@@ -209,7 +211,7 @@ Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-options = {'disp': True, 'maxcor': 30, 'ftol': args.tol}
+options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
 uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
 
 Print(f"Initial functional: {Jhat(ucontrols)}")
