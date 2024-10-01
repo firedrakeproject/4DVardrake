@@ -183,8 +183,6 @@ for i in range(nsteps):
         J += observation_iprod(observation_error)
 
         # Look we're starting this time-chunk from an unrelated value... really!
-        # with stop_annotating(modifies=[un, un1]):
-        #     pass
         un.assign(uc)
         un1.assign(uc)
 
