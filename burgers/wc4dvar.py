@@ -170,7 +170,7 @@ for i in range(nsteps):
     if (i + 1) == obs_times[observation_idx]:
         # smuggle initial guess at this time into the control without the tape seeing
         with stop_annotating():
-            uc = un._ad_copy()
+            uc = un.copy(deepcopy=True)
             ucontrols.append(uc)
             uc.topological.rename(f"Control {observation_idx}")
 
