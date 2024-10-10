@@ -164,3 +164,7 @@ cython_debug/
 # VTK files
 *.vtu
 *.pvd
+
+# figures
+*.pdf
+*.png
