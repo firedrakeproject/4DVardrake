@@ -37,6 +37,7 @@ parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of obser
 parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
 parser.add_argument('--n_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
+parser.add_argument('--method', type=str, default='bfgs', help='Minimization method.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
@@ -170,7 +171,7 @@ for i in range(nsteps):
     if (i + 1) == obs_times[observation_idx]:
         # smuggle initial guess at this time into the control without the tape seeing
         with stop_annotating():
-            uc = un._ad_copy()
+            uc = un.copy(deepcopy=True)
             ucontrols.append(uc)
             uc.topological.rename(f"Control {observation_idx}")
 
@@ -192,27 +193,35 @@ for i in range(nsteps):
         if observation_idx == len(obs_times):
             break
 
-Print("Setting up ReducedFunctional")
 controls = [Control(uc) for uc in ucontrols]
 Jhat = ReducedFunctional(J, controls)
 Jhat.optimize_tape()
 
 if args.taylor_test:
-    from firedrake.adjoint import taylor_test
+    from firedrake.adjoint import taylor_to_dict
     from sys import exit
-    Print("Running Taylor test on weak-constraint reduced functional")
+    Print("Running Taylor tests on weak-constraint reduced functional")
     h = [fd.Function(V) for _ in range(len(controls))]
     for hi in h:
         hi.dat.data[:] = np.random.random_sample(hi.dat.data.shape)
-    Print(f"{taylor_test(Jhat, ucontrols, h) = }")
+    taylor_results = taylor_to_dict(Jhat, ucontrols, h)
+    Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     exit()
 
 Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
-uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
+if args.method == 'bfgs':
+    options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
+    uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
+elif args.method == 'newton':
+    options = {'disp': True, 'maxiter': args.maxcor, 'xtol': args.ftol}
+    uoptimised = minimize(Jhat, options=options, method="Newton-CG")
+else:
+    raise ValueError("Unrecognised minimization method {args.method}")
 
 Print(f"Initial functional: {Jhat(ucontrols)}")
 Print(f"Final functional: {Jhat(uoptimised)}")
@@ -232,10 +241,10 @@ for _ in range(nsteps):
     un.assign(un1)
     uopt.append(un.copy(deepcopy=True))
 
-Print(f"Initial ic error: {fd.errornorm(background, ic_target) = }")
-Print(f"Final ic error: {fd.errornorm(uoptimised[0], ic_target) = }")
-Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1]) = }")
-Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1]) = }")
+Print(f"Initial ic error: {fd.errornorm(background, ic_target)}")
+Print(f"Final ic error: {fd.errornorm(uoptimised[0], ic_target)}")
+Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1])}")
+Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1])}")
 
 if args.vtk:
     from burgers_utils import InterpWriter

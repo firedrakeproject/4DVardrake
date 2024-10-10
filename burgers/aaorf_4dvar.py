@@ -41,6 +41,7 @@ parser.add_argument('--obs_density', type=int, default=30, help='Frequency of ob
 parser.add_argument('--n_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--no_initial_obs', action='store_true', help='No observation at initial time.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
+parser.add_argument('--method', type=str, default='bfgs', help='Minimization method.')
 parser.add_argument('--constraint', type=str, default='weak', choices=['weak', 'strong'], help='4DVar formulation to use.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
@@ -220,7 +221,7 @@ if args.taylor_test:
         stime = MPI.Wtime()
         taylor_results = taylor_to_dict(Jhat, ucs, h)
         etime = MPI.Wtime()
-        Print(f"Taylor test took {etime-stime} seconds")
+        # Print(f"Taylor test took {etime-stime} seconds")
         Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
         Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
         Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
@@ -243,8 +244,19 @@ Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
-uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
+ucontrols = [c.control.copy(deepcopy=True) for c in Jhat.controls]
+
+if args.method == 'bfgs':
+    options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
+    uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
+elif args.method == 'newton':
+    options = {'disp': True, 'maxiter': args.maxcor, 'xtol': args.ftol}
+    uoptimised = minimize(Jhat, options=options, method="Newton-CG")
+else:
+    raise ValueError("Unrecognised minimization method {args.method}")
+
+Print(f"Initial functional: {Jhat(ucontrols)}")
+Print(f"Final functional: {Jhat(uoptimised)}")
 
 Jhat.optimize_tape()
 if args.visualise:
@@ -279,13 +291,15 @@ if Jhat.weak_constraint:
             un.assign(uoptimised[observation_idx])
             observation_idx += 1
         uopt_weak.append(un.copy(deepcopy=True))
+        if observation_idx >= len(obs_times):
+            break
 
-Print(f"Initial ic error: {fd.errornorm(background, ic_target) = }")
-Print(f"Final ic error: {fd.errornorm(uopt0, ic_target) = }")
-Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1]) = }")
-Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1]) = }")
-if Jhat.weak_constraint:
-    Print(f"Final terminal error: {fd.errornorm(uopt_weak[-1], utargets[-1]) = }")
+Print(f"Initial ic error: {fd.errornorm(background, ic_target)}")
+Print(f"Final ic error: {fd.errornorm(uopt0, ic_target)}")
+Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1])}")
+Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1])}")
+# if Jhat.weak_constraint:
+#     Print(f"Final terminal error: {fd.errornorm(uopt_weak[-1], utargets[-1])}")
 
 if args.vtk:
     from burgers_utils import InterpWriter
