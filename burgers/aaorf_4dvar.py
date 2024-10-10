@@ -157,8 +157,6 @@ model_iprod = partial(wl2prod, w=Q, ad_block_tag='Model inner product')
 tape = get_working_tape()
 continue_annotation()
 
-un.assign(background)
-
 uapprox = [background.copy(deepcopy=True, annotate=False)]
 
 Jhat = AllAtOnceReducedFunctional(
@@ -170,6 +168,8 @@ Jhat = AllAtOnceReducedFunctional(
     _annotate_accumulation=False)
 
 Jhat.background.topological.rename("Background")
+
+un.assign(background)
 
 Print("Running forward model")
 
@@ -221,9 +221,9 @@ if args.taylor_test:
         taylor_results = taylor_to_dict(Jhat, ucs, h)
         etime = MPI.Wtime()
         Print(f"Taylor test took {etime-stime} seconds")
-        Print(f"{taylor_results['R0']['Rate'] = }")
-        Print(f"{taylor_results['R1']['Rate'] = }")
-        Print(f"{taylor_results['R2']['Rate'] = }")
+        Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
+        Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
+        Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     else:
         Print("Running Taylor test on equivalent ReducedFunctional")
         weak_reduced_functional = ReducedFunctional(Jhat._total_functional, Jhat.controls)
