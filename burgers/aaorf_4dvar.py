@@ -1,10 +1,9 @@
 # Burgers equation N-wave on a 1D periodic domain
 import firedrake as fd
 from firedrake.petsc import PETSc
-from pyop2.mpi import MPI
 from firedrake.__future__ import interpolate
 from firedrake.adjoint import (continue_annotation, get_working_tape, pause_annotation,
-                               Control, ReducedFunctional, minimize)
+                               Control, minimize)
 from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional
 from burgers_utils import noisy_double_sin, burgers_stepper
 import numpy as np
@@ -12,7 +11,7 @@ from functools import partial
 import argparse
 from sys import exit
 
-pause_annotation()
+np.set_printoptions(legacy='1.25')
 
 Print = PETSc.Sys.Print
 
@@ -81,7 +80,7 @@ V = un.function_space()
 # true initial condition and perturbed starting guess
 ic_target = noisy_double_sin(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
 background = noisy_double_sin(V, avg=args.ubar, mag=0.5*args.prior_mag,
-                              shift=args.prior_shift, noise=args.prior_noise, seed=args.seed)
+                              shift=args.prior_shift, noise=args.prior_noise, seed=None)
 background.topological.rename('Control 0')
 
 uend_target = fd.Function(V, name="Target")
@@ -165,12 +164,11 @@ Jhat = AllAtOnceReducedFunctional(
     background_iprod=background_iprod,
     observation_iprod=observation_iprod if initial_observations else None,
     observation_err=partial(observation_err, 0, name='Model observation 0') if initial_observations else None,
-    weak_constraint=(args.constraint == 'weak'),
-    _annotate_accumulation=False)
-
-Jhat.background.topological.rename("Background")
+    weak_constraint=(args.constraint == 'weak'))
 
 un.assign(background)
+
+Jhat.background.topological.rename("Background")
 
 Print("Running forward model")
 
@@ -201,43 +199,41 @@ for i in range(nsteps):
 pause_annotation()
 
 if args.taylor_test:
-    from firedrake.adjoint import taylor_to_dict
-    h = [fd.Function(V) for _ in range(len(Jhat.controls))]
-    for hi in h[:1]:
-        hi.dat.data[:] = np.random.random_sample(hi.dat.data.shape)
-    ucs = [c.control for c in Jhat.controls]
+    from firedrake.adjoint import taylor_to_dict, taylor_test
+    h = [fd.Function(V).zero() for _ in range(len(Jhat.controls))]
+    for hi in h:
+        hi.dat.data[:] = 0.1*np.random.random_sample(hi.dat.data.shape)
+    ucs = [c.copy_data() for c in Jhat.controls]
 
-    if not Jhat._annotate_accumulation:
-        Print("Running Taylor tests on AllAtOnceReducedFunctional")
-        Print(f"{len(Jhat.tape._blocks) = }")
-        Jhat.optimize_tape()
-        Print(f"{len(Jhat.tape._blocks) = }")
-        Print(f"{len(Jhat.background_rf.tape._blocks) = }")
-        for i, obs_rf in enumerate(Jhat.observation_rfs):
-            Print(f"{i = }, {len(obs_rf.tape._blocks) = }")
-        for i, model_rf in enumerate(Jhat.forward_model_rfs):
-            Print(f"{i = }, {len(model_rf.tape._blocks) = }")
+    Print(f"{Jhat(ucs) = }")
+    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
+    Print("Updating ucs...")
+    for ui, hi in zip(ucs, h):
+        ui += hi
+    Print("ucs updated")
+    Print(f"{Jhat(ucs) = }")
+    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
 
-        stime = MPI.Wtime()
-        taylor_results = taylor_to_dict(Jhat, ucs, h)
-        etime = MPI.Wtime()
-        # Print(f"Taylor test took {etime-stime} seconds")
-        Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
-        Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
-        Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
-    else:
-        Print("Running Taylor test on equivalent ReducedFunctional")
-        weak_reduced_functional = ReducedFunctional(Jhat._total_functional, Jhat.controls)
-        Print(f"{len(weak_reduced_functional.tape._blocks) = }")
-        weak_reduced_functional.optimize_tape()
-        Print(f"{len(weak_reduced_functional.tape._blocks) = }")
-        stime = MPI.Wtime()
-        taylor_results = taylor_to_dict(weak_reduced_functional, ucs, h)
-        etime = MPI.Wtime()
-        Print(f"Taylor test took {etime-stime} seconds")
-        Print(f"{taylor_results['R0']['Rate'] = }")
-        Print(f"{taylor_results['R1']['Rate'] = }")
-        Print(f"{taylor_results['R2']['Rate'] = }")
+    Jhat.background_error.tape.visualise(output='dag_bkg_error.pdf')
+    Jhat.background_rf.tape.visualise(output='dag_bkg_rf.pdf')
+
+    for i in range(len(Jhat.observation_rfs)):
+        Jhat.observation_rfs[i].tape.visualise(output=f'dag_obs_rf_{i}.pdf')
+        Jhat.observation_errors[i].tape.visualise(output=f'dag_obs_err_{i}.pdf')
+
+    for i in range(len(Jhat.forward_model_rfs)):
+        Jhat.forward_model_rfs[i].tape.visualise(output=f'dag_model_rf_{i+1}.pdf')
+        Jhat.forward_model_stages[i].tape.visualise(output=f'dag_model_stage_{i+1}.pdf')
+        Jhat.forward_model_errors[i].tape.visualise(output=f'dag_model_error_{i+1}.pdf')
+
+    Print("Running Taylor tests on AllAtOnceReducedFunctional")
+    Print(f"{taylor_test(Jhat, ucs, h) = }")
+    exit()
+
+    taylor_results = taylor_to_dict(Jhat, ucs, h)
+    Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     exit()
 
 Print("Minimizing 4DVar functional")
@@ -258,8 +254,8 @@ else:
 Print(f"Initial functional: {Jhat(ucontrols)}")
 Print(f"Final functional: {Jhat(uoptimised)}")
 
-Jhat.optimize_tape()
 if args.visualise:
+    Jhat.optimize_tape()
     if args.dag_file is None:
         filename = f'dag_{args.constraint}_aaorf'
     else:

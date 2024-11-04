@@ -9,7 +9,7 @@ import numpy as np
 from functools import partial
 import argparse
 
-pause_annotation()
+np.set_printoptions(legacy='1.25')
 
 Print = PETSc.Sys.Print
 
@@ -34,7 +34,7 @@ parser.add_argument('--Q', type=float, default=1.0, help='Model trust weighting.
 parser.add_argument('--R', type=float, default=1.0, help='Observation trust weighting.')
 parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
-parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
+parser.add_argument('--obs_density', type=int, default=30, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
 parser.add_argument('--n_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--method', type=str, default='bfgs', help='Minimization method.')
@@ -72,7 +72,7 @@ V = un.function_space()
 # true initial condition and perturbed starting guess
 ic_target = noisy_double_sin(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
 background = noisy_double_sin(V, avg=args.ubar, mag=0.5*args.prior_mag,
-                              shift=args.prior_shift, noise=args.prior_noise, seed=args.seed)
+                              shift=args.prior_shift, noise=args.prior_noise, seed=None)
 background.topological.rename('Background')
 
 uend_target = fd.Function(V, name="Target")
@@ -172,8 +172,8 @@ for i in range(nsteps):
         # smuggle initial guess at this time into the control without the tape seeing
         with stop_annotating():
             uc = un.copy(deepcopy=True)
-            ucontrols.append(uc)
-            uc.topological.rename(f"Control {observation_idx}")
+        ucontrols.append(uc)
+        uc.topological.rename(f"Control {observation_idx}")
 
         # model error:
         model_err = un - uc
@@ -191,17 +191,33 @@ for i in range(nsteps):
         if observation_idx == len(obs_times):
             break
 
+pause_annotation()
+
 controls = [Control(uc) for uc in ucontrols]
 Jhat = ReducedFunctional(J, controls)
 Jhat.optimize_tape()
 
 if args.taylor_test:
-    from firedrake.adjoint import taylor_to_dict
+    from firedrake.adjoint import taylor_to_dict, taylor_test
     from sys import exit
-    Print("Running Taylor tests on weak-constraint reduced functional")
     h = [fd.Function(V) for _ in range(len(controls))]
     for hi in h:
-        hi.dat.data[:] = np.random.random_sample(hi.dat.data.shape)
+        hi.dat.data[:] = 0.1*np.random.random_sample(hi.dat.data.shape)
+    ucs = [u.copy(deepcopy=True) for u in ucontrols]
+
+    Print(f"{Jhat(ucs) = }")
+    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
+    Print("Updating ucs...")
+    for ui, hi in zip(ucs, h):
+        ui += hi
+    Print("ucs updated")
+    Print(f"{Jhat(ucs) = }")
+    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
+
+    Print("Running Taylor tests on weak-constraint reduced functional")
+    Print(f"{taylor_test(Jhat, ucs, h) = }")
+    exit()
+
     taylor_results = taylor_to_dict(Jhat, ucontrols, h)
     Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
     Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
@@ -227,7 +243,6 @@ Print(f"Final functional: {Jhat(uoptimised)}")
 if args.visualise:
     tape.visualise(output='dag_wc.pdf')
 tape.clear_tape()
-pause_annotation()
 
 uopt = [uoptimised[0].copy(deepcopy=True)]
 

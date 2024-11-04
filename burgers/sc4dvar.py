@@ -177,20 +177,31 @@ Jhat = ReducedFunctional(J, ic)
 Jhat.optimize_tape()
 
 if args.taylor_test:
-    from firedrake.adjoint import taylor_test
+    from firedrake.adjoint import taylor_to_dict
     from sys import exit
-    Print("Running Taylor test on strong-constraint reduced functional")
+    Print("Running Taylor tests on strong-constraint reduced functional")
     h = fd.Function(V)
-    h.dat.data[:] = np.random.random_sample(h.dat.data.shape)
-    Print(f"{taylor_test(Jhat, ic_approx, h) = }")
+    for hdat in h.dat:
+        hdat.data[:] = np.random.random_sample(hdat.data.shape)
+    # Print(f"{taylor_test(Jhat, ic_approx, h) = }")
+    taylor_results = taylor_to_dict(Jhat, ic_approx, h)
+    Print(f"{taylor_results['R0']['Rate'] = }")
+    Print(f"{taylor_results['R1']['Rate'] = }")
+    Print(f"{taylor_results['R2']['Rate'] = }")
+    Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
+    Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     exit()
 
 Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
-options = {'disp': True, 'maxcor': 30, 'ftol': args.tol}
-ic_opt = minimize(Jhat, options=options, method="L-BFGS-B")
+# options = {'disp': True, 'maxcor': 30, 'ftol': args.tol}
+# ic_opt = minimize(Jhat, options=options, method="L-BFGS-B")
+
+options = {'disp': True}
+ic_opt = minimize(Jhat, options=options, method="Newton-CG")
 
 Print(f"Initial functional: {Jhat(background)}")
 Print(f"Final functional: {Jhat(ic_opt)}")
