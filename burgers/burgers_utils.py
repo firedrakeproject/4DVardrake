@@ -9,7 +9,7 @@ class InterpWriter:
     def __init__(self, fname, Vsrc, Vout, vnames=None):
         vnames = [] if vnames is None else vnames
         self.Vsrc, self.Vout = Vsrc, Vout
-        self.ofile = VTKFile(fname)
+        self.ofile = VTKFile(fname, comm=Vsrc.mesh().comm)
         self.usrc = fd.Function(Vsrc)
         if vnames is None:
             self.uouts = [fd.Function(Vout)]
@@ -19,7 +19,7 @@ class InterpWriter:
         self.interpolator = Interpolator(self.usrc, Vout)
 
     def write(self, *args, t=None):
-        for us, uo in zip(args, self.uouts):
+        for i, (us, uo) in enumerate(zip(args, self.uouts)):
             self.usrc.assign(us)
             uo.assign(fd.assemble(self.interpolator.interpolate()))
         self.ofile.write(*self.uouts, time=t)

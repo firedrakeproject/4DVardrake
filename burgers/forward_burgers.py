@@ -48,8 +48,9 @@ write = InterpWriter("output/burgers.pvd", V, V_out, "Velocity").write
 write(un, t=0)
 
 t = 0.0
-while (t <= args.tend):
+while (t <= args.tend - 0.5*dt):
     stepper.solve()
     un.assign(un1)
     t += dt
     write(un, t=t)
+    Print(f"Time = {str(round(t, 4)).ljust(6)} | Norm = {fd.norm(un)}")

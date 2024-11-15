@@ -10,10 +10,20 @@ import numpy as np
 from functools import partial
 import argparse
 from sys import exit
+from math import ceil
+
+
+def scalarSend(comm, x, dtype=float, **kwargs):
+    comm.Send(x*np.ones(1, dtype=dtype), **kwargs)
+
+
+def scalarRecv(comm, dtype=float, **kwargs):
+    xtmp = np.zeros(1, dtype=dtype)
+    comm.Recv(xtmp, **kwargs)
+    return xtmp[0]
+
 
 np.set_printoptions(legacy='1.25')
-
-Print = PETSc.Sys.Print
 
 parser = argparse.ArgumentParser(
     description='Weak constraint 4DVar for the viscous Burgers equation.',
@@ -42,6 +52,7 @@ parser.add_argument('--no_initial_obs', action='store_true', help='No observatio
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--method', type=str, default='bfgs', help='Minimization method.')
 parser.add_argument('--constraint', type=str, default='weak', choices=['weak', 'strong'], help='4DVar formulation to use.')
+parser.add_argument('--nchunks', type=int, default=1, help='Number of chunks in time.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--vtk_file', type=str, default='burgers_4dvar', help='VTK file name.')
@@ -49,16 +60,19 @@ parser.add_argument('--progress', action='store_true', help='Show tape progress 
 parser.add_argument('--visualise', action='store_true', help='Visualise DAG.')
 parser.add_argument('--dag_file', type=str, default=None, help='DAG file name.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
+parser.add_argument('--verbose', action='store_true', help='Print a load of stuff.')
 
 args = parser.parse_known_args()
 args = args[0]
 
+Print = lambda *ags, **kws: PETSc.Sys.Print(*ags, **kws) if args.verbose else None
+
 if args.show_args:
-    Print(args)
+    PETSc.Sys.Print(args)
 
 initial_observations = not args.no_initial_obs
 
-Print("Setting up problem")
+PETSc.Sys.Print("Setting up problem")
 np.random.seed(args.seed)
 
 # problem parameters
@@ -71,8 +85,27 @@ B = fd.Constant(args.B)
 R = fd.Constant(args.R)
 Q = fd.Constant(args.Q)
 
-mesh = fd.PeriodicUnitIntervalMesh(args.nx, name="Domain mesh")
-mesh_out = fd.UnitIntervalMesh(args.nx)
+# do the chunks correspond to the observation times?
+Nt = ceil(args.tend/dt)
+nglobal_observations = Nt//args.obs_freq
+assert (nglobal_observations % args.nchunks) == 0
+nlocal_observations = nglobal_observations//args.nchunks
+nt = Nt//nglobal_observations
+PETSc.Sys.Print(f"Total timesteps = {Nt}")
+PETSc.Sys.Print(f"Local timesteps = {nt}")
+PETSc.Sys.Print(f"Total observations = {nglobal_observations}")
+PETSc.Sys.Print(f"Local observations = {nlocal_observations}")
+
+global_comm = fd.COMM_WORLD
+if global_comm.size % args.nchunks != 0:
+    raise ValueError("Number of time-chunks must exactly divide size of COMM_WORLD")
+nranks_space = global_comm.size // args.nchunks
+ensemble = fd.Ensemble(global_comm, nranks_space)
+last_rank = ensemble.ensemble_comm.size - 1
+trank = ensemble.ensemble_comm.rank
+
+mesh = fd.PeriodicUnitIntervalMesh(args.nx, name="Domain mesh", comm=ensemble.comm)
+mesh_out = fd.UnitIntervalMesh(args.nx, comm=ensemble.comm)
 
 un, un1, stepper = burgers_stepper(nu, dt, theta, mesh)
 V = un.function_space()
@@ -80,17 +113,14 @@ V = un.function_space()
 # true initial condition and perturbed starting guess
 ic_target = noisy_double_sin(V, avg=args.ubar, mag=0.5, shift=-0.02, noise=None)
 background = noisy_double_sin(V, avg=args.ubar, mag=0.5*args.prior_mag,
-                              shift=args.prior_shift, noise=args.prior_noise, seed=None)
+                                  shift=args.prior_shift, noise=args.prior_noise, seed=None)
 background.topological.rename('Control 0')
-
-uend_target = fd.Function(V, name="Target")
-
-un.assign(ic_target)
-un1.assign(ic_target)
 
 # target forward solution
 
-Print("Running target forward model")
+global_comm.Barrier()
+PETSc.Sys.Print("Running target forward model")
+global_comm.Barrier()
 
 # observations taken on VOM
 if args.obs_spacing == 'equidistant':
@@ -111,40 +141,57 @@ def H(x, name=None):
 
 
 y = []
-utargets = [ic_target.copy(deepcopy=True)]
+utargets = []
+obs_times = []
 
 # calculate "ground truth" observation values from target ic
-t = 0.0
-nsteps = int(0)
-obs_times = []
-Print(f"Time = {str(round(t, 4)).ljust(6)} | {fd.norm(un)    = }")
-if initial_observations:
-    obs_times.append(0)
-    yn = H(un, name=f'Observation {len(obs_times)-1}')
-    y.append(yn)
-    Print(f"              | {fd.norm(yn)    = }")
-
-while (t + 0.5*dt) <= args.tend:
-    un1.assign(un)
-    stepper.solve()
-    un.assign(un1)
-    t += dt
-    nsteps += 1
-    utargets.append(un.copy(deepcopy=True))
-    # Print(f"Time = {str(round(t, 4)).ljust(6)} | {fd.norm(un)    = }")
-    # Print(f"              | {fd.norm(H(un)) = }")
-    if (nsteps % args.obs_freq) == 0:
-        obs_times.append(nsteps)
+if trank == 0:
+    utargets = [ic_target.copy(deepcopy=True)]
+    t = 0.0
+    nsteps = int(0)
+    un.assign(ic_target)
+    un1.assign(ic_target)
+    # Print(f"Time = {str(round(t, 4)).ljust(6)} | {fd.norm(un)    = }", comm=ensemble.comm)
+    if initial_observations:
+        obs_times.append(0)
         yn = H(un, name=f'Observation {len(obs_times)-1}')
         y.append(yn)
-        Print(f"Time = {str(round(t, 4)).ljust(6)} | {fd.norm(un)    = }")
-        Print(f"              | {fd.norm(yn)    = }")
-Print(f"Number of timesteps {nsteps = }")
-Print(f"Number of observations {len(y) = }")
-Print(f"{obs_times = }")
+        # Print(f"              | {fd.norm(yn)    = }", comm=ensemble.comm)
+
+else:
+    ensemble.recv(un, source=trank-1, tag=trank+000)
+    t = scalarRecv(ensemble.ensemble_comm, dtype=float, source=trank-1, tag=trank+100)
+    nsteps = scalarRecv(ensemble.ensemble_comm, dtype=int, source=trank-1, tag=trank+200)
+
+
+for k in range(nlocal_observations):
+    for i in range(nt):
+        un1.assign(un)
+        stepper.solve()
+        un.assign(un1)
+        t += dt
+        nsteps += 1
+        utargets.append(un.copy(deepcopy=True))
+    
+    assert (nsteps % args.obs_freq) == 0
+    obs_times.append(nsteps)
+    yn = H(un, name=f'Observation {len(obs_times)-1}')
+    y.append(yn)
+Print(f"{trank = } | {obs_times = }", comm=ensemble.comm)
+
+if trank != last_rank:
+    ensemble.send(un, dest=trank+1, tag=trank+1+000)
+    scalarSend(ensemble.ensemble_comm, t, dtype=float,  dest=trank+1, tag=trank+1+100)
+    scalarSend(ensemble.ensemble_comm, nsteps, dtype=int,  dest=trank+1, tag=trank+1+200)
+
+if trank == last_rank:
+    PETSc.Sys.Print(f"Number of timesteps {nsteps = }", comm=ensemble.comm)
 
 # Initialise forward solution
-Print("Setting up adjoint model")
+global_comm.Barrier()
+PETSc.Sys.Print("Setting up adjoint model")
+global_comm.Barrier()
+
 
 # weighted l2 inner product
 def wl2prod(x, w=1.0, ad_block_tag=None):
@@ -162,113 +209,163 @@ model_iprod = partial(wl2prod, w=Q, ad_block_tag='Model inner product')
 # Initialise forward model from prior/background initial conditions
 # and accumulate weak constraint functional as we go
 
-tape = get_working_tape()
-continue_annotation()
-
 uapprox = [background.copy(deepcopy=True, annotate=False)]
+
+# Only initial rank needs data for initial conditions or time
+if trank == 0:
+    background_iprod0 = background_iprod
+    if initial_observations:
+        observation_iprod0 = observation_iprod
+        observation_err0 = partial(observation_err, 0, name='Model observation 0')
+    else:
+        observation_iprod0 = None
+        observation_err0 = None
+else:
+    background_iprod0 = None
+    observation_iprod0 = None
+    observation_err0 = None
+
+continue_annotation()
 
 Jhat = AllAtOnceReducedFunctional(
     Control(background),
-    background_iprod=background_iprod,
-    observation_iprod=observation_iprod if initial_observations else None,
-    observation_err=partial(observation_err, 0, name='Model observation 0') if initial_observations else None,
-    weak_constraint=(args.constraint == 'weak'))
+    nlocal_stages=nlocal_observations,
+    background_iprod=background_iprod0,
+    observation_iprod=observation_iprod0,
+    observation_err=observation_err0,
+    weak_constraint=(args.constraint == 'weak'),
+    ensemble=ensemble)
 
 un.assign(background)
 
 Jhat.background.topological.rename("Background")
 
-Print("Running forward model")
+global_comm.Barrier()
+PETSc.Sys.Print("Running forward model")
+global_comm.Barrier()
 
-observation_idx = 1 if initial_observations else 0
+observation_idx = 1 if initial_observations and trank == 0 else 0
 
-t = 0.0
+with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
 
-for i in range(nsteps):
-    un1.assign(un)
-    stepper.solve()
-    un.assign(un1)
+    for stage, ctx in stages:
 
-    t = t+dt
+        un.assign(stage.control)
 
-    uapprox.append(un.copy(deepcopy=True, annotate=False))
+        for i in range(nt):
+            un1.assign(un)
+            stepper.solve()
+            un.assign(un1)
+        
+            ctx.t += dt
+            ctx.nsteps += 1
 
-    if (i + 1) == obs_times[observation_idx]:
+            uapprox.append(un.copy(deepcopy=True, annotate=False))
+
+        obs_offset = 1 if initial_observations and trank == 0 else 0
+        observation_idx = ctx.local_index + obs_offset
 
         obs_error = partial(observation_err, observation_idx,
                             name=f'Model observation {observation_idx}')
 
         model_iprod = partial(wl2prod, w=Q, ad_block_tag=f'Model inner product {observation_idx}')
 
-        Jhat.set_observation(un, obs_error,
-                             observation_iprod=observation_iprod,
-                             forward_model_iprod=model_iprod)
+        stage.set_observation(un, obs_error,
+                              observation_iprod=observation_iprod,
+                              forward_model_iprod=model_iprod)
 
-        observation_idx += 1
-        if observation_idx >= len(obs_times):
-            break
+global_comm.Barrier()
 
 pause_annotation()
 
+global_comm.Barrier()
 for i in range(len(y)):
-    Print(f"trank = 0 | {i = } | {fd.norm(y[i]) = }")
+    Print(f"{trank = } | {i = } | {fd.norm(y[i]) = }", comm=ensemble.comm)
 
-Print("Evaluate Jhat in parallel")
-
+global_comm.Barrier()
 ucs = [c.copy_data() for c in Jhat.controls]
-for i, uc in enumerate(ucs):
-    scale = 1+0.1*(i+1)
-    uc *= scale
-    Print(f"trank = 0 | {i = } | {scale = } | {fd.norm(uc) = }")
-Print(f"{Jhat(ucs) = }")
+global_comm.Barrier()
 
-Print("Evaluate Jhat.derivative in parallel")
+PETSc.Sys.Print("Evaluate Jhat in parallel")
+global_comm.Barrier()
+
+for i, uc in enumerate(ucs):
+    # index of first control on chunk
+    obs_per_chunk = nlocal_observations
+    offset = 0 if trank == 0 else 1 + trank*obs_per_chunk
+    scale = 1 + 0.1*(1 + offset+i)
+    uc *= scale
+    PETSc.Sys.Print(f"{trank = } | {i = } | {scale = } | {fd.norm(uc) = }", comm=ensemble.comm)
+global_comm.Barrier()
+Print(f"{Jhat(ucs) = }")
+global_comm.Barrier()
+
+global_comm.Barrier()
+PETSc.Sys.Print("Evaluate Jhat.derivative in parallel")
+global_comm.Barrier()
 ds = Jhat.derivative()
 for i, d in enumerate(ds):
-    Print(f"trank = 0 | {i = } | {fd.norm(d) = }")
+    Print(f"{trank = } | {i = } | {fd.norm(d) = }", comm=ensemble.comm)
 
-exit()
-
-h = [fd.Function(V).assign(0.1*uc) for uc in ucs]
+# exit()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_to_dict, taylor_test
 
+    h = [fd.Function(V).assign(0.1*uc) for uc in ucs]
+
+    global_comm.Barrier()
     Print(f"{Jhat(ucs) = }")
-    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
+    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative()] = }", comm=ensemble.comm)
+    global_comm.Barrier()
     Print("Updating ucs...")
     for ui, hi in zip(ucs, h):
         ui += hi
+    global_comm.Barrier()
     Print("ucs updated")
+    global_comm.Barrier()
     Print(f"{Jhat(ucs) = }")
-    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
+    global_comm.Barrier()
+    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative()] = }", comm=ensemble.comm)
+    global_comm.Barrier()
 
-    Print("Running Taylor tests on AllAtOnceReducedFunctional")
-    Print(f"{taylor_test(Jhat, ucs, h) = }")
+    PETSc.Sys.Print("Running Taylor tests on AllAtOnceReducedFunctional")
+    global_comm.Barrier()
+    PETSc.Sys.Print(f"{trank = } | {taylor_test(Jhat, ucs, h) = }", comm=ensemble.comm)
     exit()
 
-Print("Minimizing 4DVar functional")
+
+##################################################
+
+tape = get_working_tape()
+
+PETSc.Sys.Print("Minimizing 4DVar functional")
 if args.progress:
     tape.progress_bar = fd.ProgressBar
 
 ucontrols = [c.control.copy(deepcopy=True) for c in Jhat.controls]
 
-# minimiser should be given the derivative not the gradient
-derivative_options = {'riesz_representation': 'l2'}
-
 if args.method == 'bfgs':
-    options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
-    uoptimised = minimize(Jhat, options=options, method="L-BFGS-B",
-                          derivative_options=derivative_options)
+    options = {'disp': trank == 0, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
+    uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
 elif args.method == 'newton':
-    options = {'disp': True, 'maxiter': args.maxcor, 'xtol': args.ftol}
-    uoptimised = minimize(Jhat, options=options, method="Newton-CG",
-                          derivative_options=derivative_options)
+    options = {'disp': trank == 0, 'maxiter': args.maxcor, 'xtol': args.ftol}
+    uoptimised = minimize(Jhat, options=options, method="Newton-CG")
 else:
     raise ValueError("Unrecognised minimization method {args.method}")
 
-Print(f"Initial functional: {Jhat(ucontrols)}")
-Print(f"Final functional: {Jhat(uoptimised)}")
+print(f"{trank = } | {len(ucontrols) = }")
+print(f"{trank = } | {len(uoptimised) = }")
+
+for uc in Jhat.controls:
+    uc = uc.control
+    print(f"{trank = } | {uc = }")
+
+for uo in uoptimised:
+    print(f"{trank = } | {uo = } | {uo.ufl_operands[0] = }")
+
+PETSc.Sys.Print(f"Initial functional: {Jhat(ucontrols)}")
+PETSc.Sys.Print(f"Final functional: {Jhat(uoptimised)}")
 
 if args.visualise:
     Jhat.optimize_tape()
@@ -306,14 +403,12 @@ if Jhat.weak_constraint:
         if observation_idx >= len(obs_times):
             break
 
-Print(f"Initial ic error: {fd.errornorm(background, ic_target)}")
-Print(f"Final ic error: {fd.errornorm(uopt0, ic_target)}")
-Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1])}")
+PETSc.Sys.Print(f"Initial ic error: {fd.errornorm(background, ic_target)}")
+PETSc.Sys.Print(f"Final ic error: {fd.errornorm(uopt0, ic_target)}")
+PETSc.Sys.Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1])}")
+PETSc.Sys.Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1])}")
 if Jhat.weak_constraint:
-    Print(f"Final strong terminal error: {fd.errornorm(uopt[-1], utargets[-1])}")
-    Print(f"Final weak terminal error: {fd.errornorm(uopt_weak[-1], utargets[-1])}")
-else:
-    Print(f"Final terminal error: {fd.errornorm(uopt[-1], utargets[-1])}")
+    PETSc.Sys.Print(f"Final terminal error: {fd.errornorm(uopt_weak[-1], utargets[-1])}")
 
 if args.vtk:
     from burgers_utils import InterpWriter
