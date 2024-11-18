@@ -246,10 +246,12 @@ global_comm.Barrier()
 
 observation_idx = 1 if initial_observations and trank == 0 else 0
 
+# t and nsteps will be passed from one stage to another (including between ensemble members)
 with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
 
     for stage, ctx in stages:
 
+        # start forward model for this stage
         un.assign(stage.control)
 
         for i in range(nt):
@@ -257,19 +259,26 @@ with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
             stepper.solve()
             un.assign(un1)
         
+            # increment the time and timestep
             ctx.t += dt
             ctx.nsteps += 1
 
             uapprox.append(un.copy(deepcopy=True, annotate=False))
 
+        # index of the observation data for this stage on this ensemble member
         obs_offset = 1 if initial_observations and trank == 0 else 0
-        observation_idx = ctx.local_index + obs_offset
+        local_obs_idx = ctx.local_index + obs_offset
 
-        obs_error = partial(observation_err, observation_idx,
-                            name=f'Model observation {observation_idx}')
+        # index of this observation globally
+        global_obs_idx = ctx.global_index + (1 if initial_observations else 0)
 
-        model_iprod = partial(wl2prod, w=Q, ad_block_tag=f'Model inner product {observation_idx}')
+        obs_error = partial(observation_err, local_obs_idx,
+                            name=f'Model observation {global_obs_idx}')
 
+        model_iprod = partial(wl2prod, w=Q,
+                              ad_block_tag=f'Model inner product {global_obs_idx}')
+
+        # record the observation at the end of the stage
         stage.set_observation(un, obs_error,
                               observation_iprod=observation_iprod,
                               forward_model_iprod=model_iprod)
