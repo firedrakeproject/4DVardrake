@@ -54,6 +54,7 @@ parser.add_argument('--method', type=str, default='bfgs', help='Minimization met
 parser.add_argument('--constraint', type=str, default='weak', choices=['weak', 'strong'], help='4DVar formulation to use.')
 parser.add_argument('--nchunks', type=int, default=1, help='Number of chunks in time.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
+parser.add_argument('--single_evaluation', action='store_true', help='Evaluate the functional and gradient once and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--vtk_file', type=str, default='burgers_4dvar', help='VTK file name.')
 parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
@@ -69,6 +70,10 @@ Print = lambda *ags, **kws: PETSc.Sys.Print(*ags, **kws) if args.verbose else No
 
 if args.show_args:
     PETSc.Sys.Print(args)
+
+##################################################
+### Process script arguments
+##################################################
 
 initial_observations = not args.no_initial_obs
 
@@ -104,6 +109,10 @@ ensemble = fd.Ensemble(global_comm, nranks_space)
 last_rank = ensemble.ensemble_comm.size - 1
 trank = ensemble.ensemble_comm.rank
 
+##################################################
+### Build the mesh and timestepper
+##################################################
+
 mesh = fd.PeriodicUnitIntervalMesh(args.nx, name="Domain mesh", comm=ensemble.comm)
 mesh_out = fd.UnitIntervalMesh(args.nx, comm=ensemble.comm)
 
@@ -121,6 +130,10 @@ background.topological.rename('Control 0')
 global_comm.Barrier()
 PETSc.Sys.Print("Running target forward model")
 global_comm.Barrier()
+
+##################################################
+### Select observation locations
+##################################################
 
 # observations taken on VOM
 if args.obs_spacing == 'equidistant':
@@ -143,6 +156,10 @@ def H(x, name=None):
 y = []
 utargets = []
 obs_times = []
+
+##################################################
+### Calculate "ground truth" data
+##################################################
 
 # calculate "ground truth" observation values from target ic
 if trank == 0:
@@ -172,7 +189,7 @@ for k in range(nlocal_observations):
         t += dt
         nsteps += 1
         utargets.append(un.copy(deepcopy=True))
-    
+
     assert (nsteps % args.obs_freq) == 0
     obs_times.append(nsteps)
     yn = H(un, name=f'Observation {len(obs_times)-1}')
@@ -225,18 +242,26 @@ else:
     observation_iprod0 = None
     observation_err0 = None
 
+##################################################
+### Create the 4dvar reduced functional
+##################################################
+
+# first rank has one extra control for the initial conditions
+nlocal_controls = nlocal_observations + (1 if trank == 0 else 0)
+aaofunc = fd.EnsembleFunction(ensemble, [V for _ in range(nlocal_controls)])
+
+# initial guess at first control (initial condition) is the background prior
+aaofunc.subfunctions[0].assign(background)
+
 continue_annotation()
 
 Jhat = AllAtOnceReducedFunctional(
-    Control(background),
-    nlocal_stages=nlocal_observations,
+    Control(aaofunc),
+    background=background,
     background_iprod=background_iprod0,
     observation_iprod=observation_iprod0,
     observation_err=observation_err0,
-    weak_constraint=(args.constraint == 'weak'),
-    ensemble=ensemble)
-
-un.assign(background)
+    weak_constraint=(args.constraint == 'weak'))
 
 Jhat.background.topological.rename("Background")
 
@@ -245,6 +270,11 @@ PETSc.Sys.Print("Running forward model")
 global_comm.Barrier()
 
 observation_idx = 1 if initial_observations and trank == 0 else 0
+obs_offset = observation_idx
+
+##################################################
+### Record the forward model and observations
+##################################################
 
 # t and nsteps will be passed from one stage to another (including between ensemble members)
 with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
@@ -258,15 +288,15 @@ with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
             un1.assign(un)
             stepper.solve()
             un.assign(un1)
-        
+
             # increment the time and timestep
             ctx.t += dt
             ctx.nsteps += 1
 
+            # stash the timeseries for plotting
             uapprox.append(un.copy(deepcopy=True, annotate=False))
 
         # index of the observation data for this stage on this ensemble member
-        obs_offset = 1 if initial_observations and trank == 0 else 0
         local_obs_idx = ctx.local_index + obs_offset
 
         # index of this observation globally
@@ -288,62 +318,70 @@ global_comm.Barrier()
 pause_annotation()
 
 global_comm.Barrier()
-for i in range(len(y)):
-    Print(f"{trank = } | {i = } | {fd.norm(y[i]) = }", comm=ensemble.comm)
+
+##################################################
+### Check the AllAtOnceReducedFunctional
+##################################################
 
 global_comm.Barrier()
-ucs = [c.copy_data() for c in Jhat.controls]
+ucontrol = Jhat.control.copy_data()
 global_comm.Barrier()
 
-PETSc.Sys.Print("Evaluate Jhat in parallel")
-global_comm.Barrier()
+if args.single_evaluation:
+    PETSc.Sys.Print("Evaluate Jhat in parallel")
+    global_comm.Barrier()
 
-for i, uc in enumerate(ucs):
-    # index of first control on chunk
-    obs_per_chunk = nlocal_observations
-    offset = 0 if trank == 0 else 1 + trank*obs_per_chunk
-    scale = 1 + 0.1*(1 + offset+i)
-    uc *= scale
-    PETSc.Sys.Print(f"{trank = } | {i = } | {scale = } | {fd.norm(uc) = }", comm=ensemble.comm)
-global_comm.Barrier()
-Print(f"{Jhat(ucs) = }")
-global_comm.Barrier()
+    for i, uc in enumerate(ucontrol.subfunctions):
+        # index of first control on chunk
+        obs_per_chunk = nlocal_observations
+        offset = 0 if trank == 0 else 1 + trank*obs_per_chunk
+        scale = 1 + 0.1*(1 + offset+i)
+        uc *= scale
+        PETSc.Sys.Print(f"{trank = } | {i = } | {scale = } | {fd.norm(uc) = }", comm=ensemble.comm)
+    global_comm.Barrier()
+    Print(f"{trank = } | {Jhat(ucontrol) = }", comm=ensemble.comm)
+    global_comm.Barrier()
 
-global_comm.Barrier()
-PETSc.Sys.Print("Evaluate Jhat.derivative in parallel")
-global_comm.Barrier()
-ds = Jhat.derivative()
-for i, d in enumerate(ds):
-    Print(f"{trank = } | {i = } | {fd.norm(d) = }", comm=ensemble.comm)
+    global_comm.Barrier()
+    PETSc.Sys.Print("Evaluate Jhat.derivative in parallel")
+    global_comm.Barrier()
+    deriv = Jhat.derivative()
+    for i, d in enumerate(deriv.subfunctions):
+        Print(f"{trank = } | {i = } | {fd.norm(d) = }", comm=ensemble.comm)
 
-# exit()
+    exit()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_to_dict, taylor_test
 
-    h = [fd.Function(V).assign(0.1*uc) for uc in ucs]
+    PETSc.Sys.Print("Evaluate Jhat and derivative")
+
+    h = 0.1*ucontrol.copy()
 
     global_comm.Barrier()
-    Print(f"{Jhat(ucs) = }")
-    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative()] = }", comm=ensemble.comm)
+    Print(f"{trank= } | {Jhat(ucontrol) = }", comm=ensemble.comm)
+    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative().subfunctions] = }", comm=ensemble.comm)
     global_comm.Barrier()
-    Print("Updating ucs...")
-    for ui, hi in zip(ucs, h):
+    Print("Updating ucontrol...")
+    for ui, hi in zip(ucontrol.subfunctions, h.subfunctions):
         ui += hi
     global_comm.Barrier()
-    Print("ucs updated")
+    Print("ucontrol updated")
     global_comm.Barrier()
-    Print(f"{Jhat(ucs) = }")
+    PETSc.Sys.Print("Evaluate Jhat and derivative after perturbation")
+    Print(f"{Jhat(ucontrol) = }", comm=ensemble.comm)
     global_comm.Barrier()
-    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative()] = }", comm=ensemble.comm)
+    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative().subfunctions] = }", comm=ensemble.comm)
     global_comm.Barrier()
 
     PETSc.Sys.Print("Running Taylor tests on AllAtOnceReducedFunctional")
     global_comm.Barrier()
-    PETSc.Sys.Print(f"{trank = } | {taylor_test(Jhat, ucs, h) = }", comm=ensemble.comm)
+    PETSc.Sys.Print(f"{trank = } | {taylor_test(Jhat, ucontrol, h) = }")
     exit()
 
 
+##################################################
+### Minimize
 ##################################################
 
 tape = get_working_tape()
