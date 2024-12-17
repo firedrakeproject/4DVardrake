@@ -4,7 +4,7 @@ from firedrake.petsc import PETSc
 from firedrake.__future__ import interpolate
 from firedrake.adjoint import (continue_annotation, pause_annotation,
                                get_working_tape, Control, minimize)
-from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional
+from firedrake.adjoint import FourDVarReducedFunctional
 from burgers_utils import noisy_double_sin, burgers_stepper
 import numpy as np
 from functools import partial
@@ -213,7 +213,7 @@ if trank == 0:
 
 continue_annotation()
 
-Jhat = AllAtOnceReducedFunctional(
+Jhat = FourDVarReducedFunctional(
     Control(aaofunc),
     background_iprod=background_iprod0,
     observation_iprod=observation_iprod0,

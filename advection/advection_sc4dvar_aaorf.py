@@ -3,38 +3,47 @@ from firedrake.__future__ import interpolate
 from firedrake.adjoint import (continue_annotation, pause_annotation,
                                stop_annotating, Control, taylor_test,
                                ReducedFunctional, minimize)
+from firedrake.adjoint import FourDVarReducedFunctional
 from advection_utils import *
 
-# record observation stages
 control = background.copy(deepcopy=True)
 
 continue_annotation()
 
-# background functional
-J = norm2(B)(control - background)
+# create 4DVar reduced functional and record
+# background and initial observation functionals
 
-# initial observation functional
-J += norm2(R)(observation_error(0)(control))
+Jhat = FourDVarReducedFunctional(
+    Control(control),
+    background_iprod=norm2(B),
+    observation_iprod=norm2(R),
+    observation_err=observation_error(0),
+    weak_constraint=False)
 
 nstep = 0
-qn.assign(control)
+# record observation stages
+with Jhat.recording_stages(nstages=len(targets)-1) as stages:
+    # loop over stages
+    for stage, ctx in stages:
+        # start forward model
+        qn.assign(stage.control)
 
-for i in range(1, len(targets)):
+        # propogate
+        for _ in range(observation_freq):
+            qn1.assign(qn)
+            stepper.solve()
+            qn.assign(qn1)
+            nstep += 1
 
-    for _ in range(observation_freq):
-        qn1.assign(qn)
-        stepper.solve()
-        qn.assign(qn1)
-        nstep += 1
-    obs_index = i
-    print(f"{obs_index = } | {nstep = } | {fd.norm(qn) = }")
+        obs_index = stage.index + 1
+        print(f"{obs_index = } | {nstep = } | {fd.norm(qn) = }")
 
-    # observation functional
-    J += norm2(R)(observation_error(i)(qn))
+        # take observation
+        obs_err = observation_error(obs_index)
+        stage.set_observation(qn, obs_err,
+                              observation_iprod=norm2(R))
 
 pause_annotation()
-
-Jhat = ReducedFunctional(J, Control(control))
 
 print(f"{Jhat(control) = }")
 print(f"{fd.norm(Jhat.derivative()) = }")

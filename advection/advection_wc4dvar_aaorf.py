@@ -2,7 +2,7 @@ import firedrake as fd
 from firedrake.__future__ import interpolate
 from firedrake.adjoint import (continue_annotation, pause_annotation, stop_annotating,
                                Control, taylor_test, minimize)
-from firedrake.adjoint.all_at_once_reduced_functional import AllAtOnceReducedFunctional
+from firedrake.adjoint import FourDVarReducedFunctional
 from advection_utils import *
 
 control = fd.EnsembleFunction(
@@ -17,7 +17,7 @@ continue_annotation()
 # create 4DVar reduced functional and record
 # background and initial observation functionals
 
-Jhat = AllAtOnceReducedFunctional(
+Jhat = FourDVarReducedFunctional(
     Control(control),
     background_iprod=norm2(B),
     observation_iprod=norm2(R),
