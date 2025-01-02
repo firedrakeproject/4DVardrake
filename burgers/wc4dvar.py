@@ -23,24 +23,18 @@ parser.add_argument('--ubar', type=float, default=1.0, help='Average initial vel
 parser.add_argument('--tend', type=float, default=1.0, help='Final integration time.')
 parser.add_argument('--re', type=float, default=1e2, help='Approximate Reynolds number.')
 parser.add_argument('--theta', type=float, default=0.5, help='Implicit timestepping parameter.')
-parser.add_argument('--ftol', type=float, default=1e-2, help='Optimiser tolerance for relative function reduction.')
-parser.add_argument('--gtol', type=float, default=1e-2, help='Optimiser tolerance for gradient norm.')
-parser.add_argument('--maxcor', type=int, default=20, help='Optimiser max corrections.')
-parser.add_argument('--prior_mag', type=float, default=1.1, help='Magnitude of background vs truth.')
-parser.add_argument('--prior_shift', type=float, default=0.05, help='Phase shift in background vs truth.')
-parser.add_argument('--prior_noise', type=float, default=0.05, help='Noise magnitude in background.')
+parser.add_argument('--tol', type=float, default=1e-2, help='Optimiser tolerance for relative function reduction.')
+parser.add_argument('--prior_mag', type=float, default=1.05, help='Magnitude of background vs truth.')
+parser.add_argument('--prior_shift', type=float, default=0.025, help='Phase shift in background vs truth.')
+parser.add_argument('--prior_noise', type=float, default=0.025, help='Noise magnitude in background.')
 parser.add_argument('--B', type=float, default=1e-1, help='Background trust weighting.')
-parser.add_argument('--Q', type=float, default=1.0, help='Model trust weighting.')
-parser.add_argument('--R', type=float, default=1.0, help='Observation trust weighting.')
-parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
+parser.add_argument('--Q', type=float, default=1e0, help='Model trust weighting.')
+parser.add_argument('--R', type=float, default=1e1, help='Observation trust weighting.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
-parser.add_argument('--obs_density', type=int, default=30, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
-parser.add_argument('--n_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
+parser.add_argument('--nx_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
-parser.add_argument('--method', type=str, default='bfgs', help='Minimization method.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
-parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
 parser.add_argument('--visualise', action='store_true', help='Visualise DAG.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 
@@ -77,24 +71,18 @@ background.topological.rename('Background')
 
 uend_target = fd.Function(V, name="Target")
 
-un.assign(ic_target)
-un1.assign(ic_target)
-
 # target forward solution
 
 Print("Running target forward model")
 
 # observations taken on VOM
-if args.obs_spacing == 'equidistant':
-    coords = mesh_out.coordinates.dat.data
-    obs_points = [[coords[i]] for i in range(0, len(coords), args.obs_density)]
-if args.obs_spacing == 'random':
-    obs_points = [[x] for x in sorted(np.random.random_sample(args.n_obs))]
+obs_points = [[x] for x in sorted(np.random.random_sample(args.nx_obs))]
 
 obs_mesh = fd.VertexOnlyMesh(mesh, obs_points, name="Observation locations")
 Vobs = fd.VectorFunctionSpace(obs_mesh, "DG", 0)
 
 
+# observation operator
 def H(x, name=None):
     hx = fd.assemble(interpolate(x, Vobs), ad_block_tag='Observation operator')
     if name is not None:
@@ -109,6 +97,9 @@ utargets = [ic_target.copy(deepcopy=True)]
 t = 0.0
 nsteps = int(0)
 obs_times = [0]
+
+un.assign(ic_target)
+un1.assign(ic_target)
 y.append(H(un, name=f'Observation {len(obs_times)-1}'))
 while (t + 0.5*dt) <= args.tend:
     stepper.solve()
@@ -124,7 +115,7 @@ Print(f"Number of observations {len(y) = }")
 Print(f"{obs_times = }")
 
 # Initialise forward solution
-Print("Setting up adjoint model")
+Print("Setting up weak constraint 4DVar adjoint model")
 
 
 # weighted l2 inner product
@@ -142,7 +133,6 @@ model_iprod = partial(wl2prod, w=Q, ad_block_tag='Model error')
 ucontrols = [fd.Function(V, name="Control 0").assign(background)]
 
 continue_annotation()
-tape = get_working_tape()
 
 un.assign(ucontrols[0])
 un1.assign(ucontrols[0])
@@ -159,8 +149,7 @@ Print("Running forward model")
 
 # initial observation error
 hx.append(H(ucontrols[0], name=f'Model observation {observation_idx}'))
-observation_error = hx[-1] - y[observation_idx]
-J += observation_iprod(observation_error)
+J += observation_iprod(hx[-1] - y[observation_idx])
 observation_idx += 1
 
 for i in range(nsteps):
@@ -180,8 +169,7 @@ for i in range(nsteps):
         J += model_iprod(model_err)
 
         hx.append(H(uc, name=f'Model observation {observation_idx}'))
-        observation_error = hx[-1] - y[observation_idx]
-        J += observation_iprod(observation_error)
+        J += observation_iprod(hx[-1] - y[observation_idx])
 
         # Look we're starting this time-chunk from an unrelated value... really!
         un.assign(uc)
@@ -191,32 +179,19 @@ for i in range(nsteps):
         if observation_idx == len(obs_times):
             break
 
-pause_annotation()
 
-controls = [Control(uc) for uc in ucontrols]
-Jhat = ReducedFunctional(J, controls)
+Print("Setting up weak constraint 4DVar ReducedFunctional")
+Jhat = ReducedFunctional(J, [Control(uc) for uc in ucontrols])
+pause_annotation()
 Jhat.optimize_tape()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_to_dict, taylor_test
     from sys import exit
-    h = [fd.Function(V) for _ in range(len(controls))]
+    Print("Running Taylor tests on weak constraint 4DVar reduced functional")
+    h = [fd.Function(V) for _ in range(len(ucontrols))]
     for hi in h:
-        hi.dat.data[:] = 0.1*np.random.random_sample(hi.dat.data.shape)
-    ucs = [u.copy(deepcopy=True) for u in ucontrols]
-
-    Print(f"{Jhat(ucs) = }")
-    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
-    Print("Updating ucs...")
-    for ui, hi in zip(ucs, h):
-        ui += hi
-    Print("ucs updated")
-    Print(f"{Jhat(ucs) = }")
-    Print(f"{[fd.norm(d) for d in Jhat.derivative()] = }")
-
-    Print("Running Taylor tests on weak-constraint reduced functional")
-    Print(f"{taylor_test(Jhat, ucs, h) = }")
-    exit()
+        hi.dat.data[:] = np.random.random_sample(hi.dat.data.shape)
 
     taylor_results = taylor_to_dict(Jhat, ucontrols, h)
     Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
@@ -224,29 +199,14 @@ if args.taylor_test:
     Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     exit()
 
-Print("Minimizing 4DVar functional")
-if args.progress:
-    tape.progress_bar = fd.ProgressBar
-
-if args.method == 'bfgs':
-    options = {'disp': True, 'maxcor': args.maxcor, 'ftol': args.ftol, 'gtol': args.gtol}
-    uoptimised = minimize(Jhat, options=options, method="L-BFGS-B")
-elif args.method == 'newton':
-    options = {'disp': True, 'maxiter': args.maxcor, 'xtol': args.ftol}
-    uoptimised = minimize(Jhat, options=options, method="Newton-CG")
-else:
-    raise ValueError("Unrecognised minimization method {args.method}")
-
-Print(f"Initial functional: {Jhat(ucontrols)}")
-Print(f"Final functional: {Jhat(uoptimised)}")
-
-if args.visualise:
-    tape.visualise(output='dag_wc.pdf')
-tape.clear_tape()
-
-uopt = [uoptimised[0].copy(deepcopy=True)]
+Print("Minimizing weak constraint 4DVar functional")
+options = {'disp': True, 'ftol': args.tol}
+derivative_options = {'riesz_representation': 'l2'}
+uoptimised = minimize(Jhat, options=options, method="L-BFGS-B",
+                  derivative_options=derivative_options)
 
 # calculate timeseries from optimised initial conditions
+uopt = [uoptimised[0].copy(deepcopy=True)]
 un.assign(uoptimised[0])
 un1.assign(uoptimised[0])
 for _ in range(nsteps):
@@ -254,6 +214,8 @@ for _ in range(nsteps):
     un.assign(un1)
     uopt.append(un.copy(deepcopy=True))
 
+Print(f"Initial functional: {Jhat(ucontrols)}")
+Print(f"Final functional: {Jhat(uoptimised)}")
 Print(f"Initial ic error: {fd.errornorm(background, ic_target)}")
 Print(f"Final ic error: {fd.errornorm(uoptimised[0], ic_target)}")
 Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1])}")
@@ -267,5 +229,3 @@ if args.vtk:
     write = InterpWriter("output/wc_burgers_target.pvd", V, V_out, vnames).write
     for i, us in enumerate(zip(utargets, uapprox, uopt)):
         write(*us, t=i*dt)
-
-tape.clear_tape()

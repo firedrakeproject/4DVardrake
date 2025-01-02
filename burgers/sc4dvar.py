@@ -34,7 +34,6 @@ parser.add_argument('--nx_obs', type=int, default=30, help='Number of observatio
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
-parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
 parser.add_argument('--visualise', action='store_true', help='Visualise DAG.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 
@@ -114,7 +113,7 @@ Print(f"Number of observations {len(y) = }")
 Print(f"{obs_times = }")
 
 # Initialise forward solution
-Print("Setting up adjoint model")
+Print("Setting up strong constraint 4DVar adjoint model")
 
 
 # weighted l2 inner product
@@ -130,7 +129,6 @@ ic_approx = background.copy(deepcopy=True, annotate=False)
 ic_approx.topological.rename("Control")
 
 continue_annotation()
-tape = get_working_tape()
 
 un.assign(ic_approx)
 un1.assign(ic_approx)
@@ -163,28 +161,25 @@ for i in range(nsteps):
         if observation_idx == len(obs_times):
             break
 
-Print("Setting up ReducedFunctional")
+Print("Setting up strong constraint 4DVar ReducedFunctional")
 Jhat = ReducedFunctional(J, Control(ic_approx))
-Jhat.optimize_tape()
 pause_annotation()
+Jhat.optimize_tape()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_to_dict
     from sys import exit
-    Print("Running Taylor tests on strong-constraint reduced functional")
+    Print("Running Taylor tests on strong constraint 4DVar reduced functional")
     h = fd.Function(V)
     for hdat in h.dat:
         hdat.data[:] = np.random.random_sample(hdat.data.shape)
     taylor_results = taylor_to_dict(Jhat, ic_approx, h)
-    Print(f"{taylor_results['R0']['Rate'] = }")
-    Print(f"{taylor_results['R1']['Rate'] = }")
-    Print(f"{taylor_results['R2']['Rate'] = }")
     Print(f"{np.mean(taylor_results['R0']['Rate']) = }")
     Print(f"{np.mean(taylor_results['R1']['Rate']) = }")
     Print(f"{np.mean(taylor_results['R2']['Rate']) = }")
     exit()
 
-Print("Minimizing 4DVar functional")
+Print("Minimizing strong constraint 4DVar functional")
 options = {'disp': True, 'ftol': args.tol}
 derivative_options = {'riesz_representation': 'l2'}
 ic_opt = minimize(Jhat, options=options, method="L-BFGS-B",
