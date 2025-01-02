@@ -27,8 +27,6 @@ for i in range(1, len(control)):
         stepper.solve()
         qn.assign(qn1)
         nstep += 1
-    obs_index = i
-    print(f"{obs_index = } | {nstep = } | {fd.norm(qn) = }")
 
     # smuggle previous state over the observation time
     with stop_annotating():
@@ -44,28 +42,11 @@ pause_annotation()
 
 Jhat = ReducedFunctional(J, [Control(c) for c in control])
 
-print(f"{[fd.norm(v) for v in values1] = }")
-print(f"{[fd.norm(c) for c in control] = }")
-
-print(f"{Jhat(control) = }")
-derivatives = Jhat.derivative()
-print(f"{[fd.norm(d) for d in derivatives] = }")
-print()
-
-print(f"{Jhat(values) = }")
-derivatives = Jhat.derivative()
-print(f"{[fd.norm(d) for d in derivatives] = }")
-print()
-print(f"{Jhat(values1) = }")
-derivatives = Jhat.derivative()
-print(f"{[fd.norm(d) for d in derivatives] = }")
-
-print()
 print(f"{Jhat(control) = }")
 print(f"{taylor_test(Jhat, control, values) = }")
 
 options = {'disp': True, 'ftol': 1e-2}
-derivative_options = {'riesz_representation': None}
+derivative_options = {'riesz_representation': 'l2'}
 
 opt = minimize(Jhat, options=options, method="L-BFGS-B",
                derivative_options=derivative_options)

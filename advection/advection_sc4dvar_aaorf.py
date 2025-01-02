@@ -35,30 +35,13 @@ with Jhat.recording_stages(nstages=len(targets)-1) as stages:
             qn.assign(qn1)
             nstep += 1
 
-        obs_index = stage.index + 1
-        print(f"{obs_index = } | {nstep = } | {fd.norm(qn) = }")
-
         # take observation
-        obs_err = observation_error(obs_index)
+        obs_err = observation_error(stage.observation_index)
         stage.set_observation(qn, obs_err,
                               observation_iprod=norm2(R))
 
 pause_annotation()
 
-print(f"{Jhat(control) = }")
-print(f"{fd.norm(Jhat.derivative()) = }")
-print()
-
-print(f"{Jhat(values[0]) = }")
-print(f"{fd.norm(Jhat.derivative()) = }")
-print()
-
-print(f"{Jhat(values1[0]) = }")
-print(f"{fd.norm(Jhat.derivative()) = }")
-print()
-
-print(f"{Jhat(control) = }")
-print(f"{fd.norm(Jhat.derivative()) = }")
 print(f"{taylor_test(Jhat, control, values[0]) = }")
 
 options = {'disp': True, 'ftol': 1e-2}
@@ -67,8 +50,5 @@ derivative_options = {'riesz_representation': None}
 opt = minimize(Jhat, options=options, method="L-BFGS-B",
                derivative_options=derivative_options)
 
-print(f"{Jhat(opt) = }")
 print(f"{fd.errornorm(targets[0], control) = }")
 print(f"{fd.errornorm(targets[0], opt) = }")
-
-from sys import exit; exit()
