@@ -9,7 +9,7 @@ import numpy as np
 from functools import partial
 import argparse
 
-pause_annotation()
+np.set_printoptions(legacy='1.25')
 
 Print = PETSc.Sys.Print
 
@@ -24,15 +24,13 @@ parser.add_argument('--tend', type=float, default=1.0, help='Final integration t
 parser.add_argument('--re', type=float, default=1e2, help='Approximate Reynolds number.')
 parser.add_argument('--theta', type=float, default=0.5, help='Implicit timestepping parameter.')
 parser.add_argument('--tol', type=float, default=1e-2, help='Tolerance of optimiser.')
-parser.add_argument('--prior_mag', type=float, default=1.1, help='Magnitude of background vs truth.')
-parser.add_argument('--prior_shift', type=float, default=0.05, help='Phase shift in background vs truth.')
-parser.add_argument('--prior_noise', type=float, default=0.05, help='Noise magnitude in background.')
+parser.add_argument('--prior_mag', type=float, default=1.05, help='Magnitude of background vs truth.')
+parser.add_argument('--prior_shift', type=float, default=0.025, help='Phase shift in background vs truth.')
+parser.add_argument('--prior_noise', type=float, default=0.025, help='Noise magnitude in background.')
 parser.add_argument('--B', type=float, default=1e-1, help='Background trust weighting.')
-parser.add_argument('--R', type=float, default=1, help='Observation trust weighting.')
-parser.add_argument('--obs_spacing', type=str, default='random', choices=['random', 'equidistant'], help='How observation points are distributed in space.')
+parser.add_argument('--R', type=float, default=1e1, help='Observation trust weighting.')
 parser.add_argument('--obs_freq', type=int, default=10, help='Frequency of observations in time.')
-parser.add_argument('--obs_density', type=int, default=10, help='Frequency of observations in space. Only used if obs_spacing=equidistant.')
-parser.add_argument('--n_obs', type=int, default=10, help='Number of observations in space. Only used if obs_spacing=random.')
+parser.add_argument('--nx_obs', type=int, default=30, help='Number of observations in space. Only used if obs_spacing=random.')
 parser.add_argument('--seed', type=int, default=42, help='RNG seed.')
 parser.add_argument('--taylor_test', action='store_true', help='Run adjoint Taylor test and exit.')
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
@@ -72,24 +70,18 @@ background.topological.rename('Background')
 
 uend_target = fd.Function(V, name="Target")
 
-un.assign(ic_target)
-un1.assign(ic_target)
-
 # target forward solution
 
 Print("Running target forward model")
 
 # observations taken on VOM
-if args.obs_spacing == 'equidistant':
-    coords = mesh_out.coordinates.dat.data
-    obs_points = [[coords[i]] for i in range(0, len(coords), args.obs_density)]
-if args.obs_spacing == 'random':
-    obs_points = [[x] for x in sorted(np.random.random_sample(args.n_obs))]
+obs_points = [[x] for x in sorted(np.random.random_sample(args.nx_obs))]
 
 obs_mesh = fd.VertexOnlyMesh(mesh, obs_points, name="Observation locations")
 Vobs = fd.VectorFunctionSpace(obs_mesh, "DG", 0)
 
 
+# observation operator
 def H(x, name=None):
     hx = fd.assemble(interpolate(x, Vobs), ad_block_tag='Observation operator')
     if name is not None:
@@ -104,6 +96,9 @@ utargets = [ic_target.copy(deepcopy=True)]
 t = 0.0
 nsteps = int(0)
 obs_times = [0]
+
+un.assign(ic_target)
+un1.assign(ic_target)
 y.append(H(un, name=f'Observation {len(obs_times)-1}'))
 while (t + 0.5*dt) <= args.tend:
     stepper.solve()
@@ -144,7 +139,6 @@ hx = []
 observation_idx = 0
 uapprox = [ic_approx.copy(deepcopy=True, annotate=False)]
 
-
 # background error
 background_err = ic_approx - background
 J = wl2prod(background_err, B, ad_block_tag='Background error')
@@ -153,8 +147,7 @@ Print("Running forward model")
 
 # initial observation error
 hx.append(H(un, name=f'Model observation {observation_idx}'))
-observation_error = hx[-1] - y[observation_idx]
-J += observation_iprod(observation_error)
+J += observation_iprod(hx[-1] - y[observation_idx])
 observation_idx += 1
 
 for i in range(nsteps):
@@ -164,17 +157,16 @@ for i in range(nsteps):
 
     if (i + 1) == obs_times[observation_idx]:
         hx.append(H(un, name=f'Model observation {observation_idx}'))
-        observation_error = hx[-1] - y[observation_idx]
-        J += observation_iprod(observation_error)
+        J += observation_iprod(hx[-1] - y[observation_idx])
 
         observation_idx += 1
         if observation_idx == len(obs_times):
             break
 
 Print("Setting up ReducedFunctional")
-ic = Control(ic_approx)
-Jhat = ReducedFunctional(J, ic)
+Jhat = ReducedFunctional(J, Control(ic_approx))
 Jhat.optimize_tape()
+pause_annotation()
 
 if args.taylor_test:
     from firedrake.adjoint import taylor_to_dict
@@ -183,7 +175,6 @@ if args.taylor_test:
     h = fd.Function(V)
     for hdat in h.dat:
         hdat.data[:] = np.random.random_sample(hdat.data.shape)
-    # Print(f"{taylor_test(Jhat, ic_approx, h) = }")
     taylor_results = taylor_to_dict(Jhat, ic_approx, h)
     Print(f"{taylor_results['R0']['Rate'] = }")
     Print(f"{taylor_results['R1']['Rate'] = }")
@@ -194,26 +185,13 @@ if args.taylor_test:
     exit()
 
 Print("Minimizing 4DVar functional")
-if args.progress:
-    tape.progress_bar = fd.ProgressBar
-
-# options = {'disp': True, 'maxcor': 30, 'ftol': args.tol}
-# ic_opt = minimize(Jhat, options=options, method="L-BFGS-B")
-
-options = {'disp': True}
-ic_opt = minimize(Jhat, options=options, method="Newton-CG")
-
-Print(f"Initial functional: {Jhat(background)}")
-Print(f"Final functional: {Jhat(ic_opt)}")
-
-if args.visualise:
-    tape.visualise(output='dag_sc.pdf')
-tape.clear_tape()
-pause_annotation()
-
-uopt = [ic_opt.copy(deepcopy=True)]
+options = {'disp': True, 'ftol': args.tol}
+derivative_options = {'riesz_representation': 'l2'}
+ic_opt = minimize(Jhat, options=options, method="L-BFGS-B",
+                  derivative_options=derivative_options)
 
 # calculate timeseries from optimised initial conditions
+uopt = [ic_opt.copy(deepcopy=True)]
 un.assign(ic_opt)
 un1.assign(ic_opt)
 for _ in range(nsteps):
@@ -221,6 +199,8 @@ for _ in range(nsteps):
     un.assign(un1)
     uopt.append(un.copy(deepcopy=True))
 
+Print(f"Initial functional: {Jhat(background)}")
+Print(f"Final functional: {Jhat(ic_opt)}")
 Print(f"Initial ic error: {fd.errornorm(background, ic_target) = }")
 Print(f"Final ic error: {fd.errornorm(ic_opt, ic_target) = }")
 Print(f"Initial terminal error: {fd.errornorm(uapprox[-1], utargets[-1]) = }")
@@ -234,5 +214,3 @@ if args.vtk:
     write = InterpWriter("output/burgers_target.pvd", V, V_out, vnames).write
     for i, us in enumerate(zip(utargets, uapprox, uopt)):
         write(*us, t=i*dt)
-
-tape.clear_tape()
