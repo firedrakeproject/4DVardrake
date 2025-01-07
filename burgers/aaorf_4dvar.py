@@ -48,7 +48,6 @@ parser.add_argument('--single_evaluation', action='store_true', help='Evaluate t
 parser.add_argument('--vtk', action='store_true', help='Write out timeseries to VTK file.')
 parser.add_argument('--vtk_file', type=str, default='burgers_4dvar', help='VTK file name.')
 parser.add_argument('--progress', action='store_true', help='Show tape progress bar.')
-parser.add_argument('--visualise', action='store_true', help='Visualise DAG.')
 parser.add_argument('--dag_file', type=str, default=None, help='DAG file name.')
 parser.add_argument('--show_args', action='store_true', help='Output all the arguments.')
 parser.add_argument('--verbose', action='store_true', help='Print a load of stuff.')
@@ -171,7 +170,7 @@ with ensemble.sequential(t=t, nsteps=nsteps, un=un) as ctx:
             ctx.t += dt
             ctx.nsteps += 1
         utargets.append(un.copy(deepcopy=True))
-        PETSc.Sys.Print(f"{trank = } | {k = } | {len(utargets) = }", comm=ensemble.comm)
+        # PETSc.Sys.Print(f"{trank = } | {k = } | {len(utargets) = }", comm=ensemble.comm)
 
         obs_times.append(nsteps)
         y.append(H(un, name=f'Observation {len(obs_times)-1}'))
@@ -188,7 +187,7 @@ global_comm.Barrier()
 
 # weighted l2 inner product
 def wl2prod(x, w=1.0, ad_block_tag=None):
-    return fd.assemble(fd.inner(x, w*x)*fd.dx, ad_block_tag=ad_block_tag)
+    return fd.assemble(fd.inner(x, w*x)*fd.dx, ad_block_tag=ad_block_tag)**2
 
 
 def observation_err(i, state, name=None):
@@ -261,7 +260,7 @@ with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
 
         # start forward model for this stage
         un.assign(stage.control)
-        PETSc.Sys.Print(f"{fd.norm(un) = }")
+        # PETSc.Sys.Print(f"{fd.norm(un) = }")
 
         for i in range(nt):
             un1.assign(un)
@@ -290,7 +289,7 @@ with Jhat.recording_stages(t=0.0, nsteps=0) as stages:
         stage.set_observation(un, obs_error,
                               observation_iprod=observation_iprod,
                               forward_model_iprod=model_iprod)
-        PETSc.Sys.Print(f"{fd.norm(un) = }")
+        # PETSc.Sys.Print(f"{fd.norm(un) = }")
 
 global_comm.Barrier()
 
@@ -331,37 +330,24 @@ if args.single_evaluation:
     exit()
 
 if args.taylor_test:
-    from firedrake.adjoint import taylor_test
+    from firedrake.adjoint import taylor_test, taylor_to_dict
+    from fdvar_taylor import fdvar_taylor
 
-    h = 0.1*ucontrol.copy()
+    h = ucontrol.copy()
+    m = ucontrol.copy()
 
-    Print("Evaluate Jhat and derivative")
-    global_comm.Barrier()
+    for hi in h.subfunctions:
+        hi.dat.data[:] = 0.2*np.random.random_sample(hi.dat.data.shape)
+    for mi in m.subfunctions:
+        mi.dat.data[:] += 0.2*np.random.random_sample(mi.dat.data.shape)
 
-    Print(f"{trank= } | {Jhat(ucontrol) = }", comm=ensemble.comm)
-    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative().subfunctions] = }",
-          comm=ensemble.comm)
-
-    global_comm.Barrier()
-    Print("Updating ucontrol...")
-    for ui, hi in zip(ucontrol.subfunctions, h.subfunctions):
-        ui += hi
-    global_comm.Barrier()
-    Print("ucontrol updated")
-    global_comm.Barrier()
-
-    Print("Evaluate Jhat and derivative after perturbation")
-    global_comm.Barrier()
-
-    Print(f"{Jhat(ucontrol) = }", comm=ensemble.comm)
-    global_comm.Barrier()
-    Print(f"{trank = } | {[fd.norm(d) for d in Jhat.derivative().subfunctions] = }",
-          comm=ensemble.comm)
-    global_comm.Barrier()
-
-    PETSc.Sys.Print("Running Taylor tests on FourDVarReducedFunctional")
-    global_comm.Barrier()
-    PETSc.Sys.Print(f"{trank = } | {taylor_test(Jhat, ucontrol, h) = }")
+    fdvar_taylor(Jhat, m, h,
+                 residuals=False,
+                 test_fdv=True,
+                 test_background=True,
+                 test_observations=True,
+                 test_model=True,
+                 test_stage=True)
     exit()
 
 
