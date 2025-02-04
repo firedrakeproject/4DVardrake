@@ -3,13 +3,9 @@ from firedrake.__future__ import interpolate
 import numpy as np
 from sys import exit
 
+from firedrake.adjoint.fourdvar_reduced_functional import covariance_norm
+
 np.set_printoptions(legacy='1.25', precision=6)
-
-
-def norm2(w):
-    def n2(x):
-        return fd.assemble(fd.inner(x, fd.Constant(w)*x)*fd.dx)
-    return n2
 
 
 def timestepper(mesh, V, dt, u):
@@ -45,9 +41,9 @@ def analytic_solution(mesh, u, t, mag=1.0, phase=0.0):
     x, = fd.SpatialCoordinate(mesh)
     return mag*fd.sin(2*fd.pi*((x + phase) - u*t))
 
-B = 1
-R = 1
-Q = 1
+B = 10.
+R = 0.1
+Q = 0.2*B
 
 ensemble = fd.Ensemble(fd.COMM_WORLD, 1)
 
